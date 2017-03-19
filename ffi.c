@@ -107,16 +107,9 @@ int pusharg_cvar(ffi_raw *arg, struct cvar *var, ffi_type *ftype)
 {
 	ffi_type *vartype = var->type;
 
-	if (ftype == vartype ||
-		(TYPE_IS_INT(ftype->type) && TYPE_IS_INT(vartype->type)) ||
-		(TYPE_IS_FLOAT(ftype->type) && TYPE_IS_FLOAT(vartype->type))) {
-		if (ftype->size < vartype->size)
-			return 0;
-		if (var->type->size > sizeof (arg->data)) {
-			arg->ptr = var->mem;
-		} else {
-			memcpy(arg->data, var->mem, var->type->size);
-		}
+	/* TODO: C -> C casts */
+	if (ftype == vartype) {
+		memcpy(arg->data, var->mem, vartype->size);
 		return 1;
 	}
 	return 0;
@@ -132,75 +125,70 @@ static const char *type_names[] = {
 #include "casts.c"
 
 static
-ffi_type *pusharg(lua_State *L, int i, ffi_raw *args, ffi_type *ftype)
+ffi_raw *pusharg(lua_State *L, int i, ffi_raw *arg, ffi_type *ftype)
 {
 	int ltype;
 	const char *ltypename;
-	ffi_raw *arg;
 	struct cvar *var;
+	void *fn;
 
-	arg = &args[i];
-	ltype = lua_type(L, ++i); /* lua index = C index + 1 */
-#define CHECK(T1, T2) if (!T1) T1 = T2; else if (T1 != T2) goto convert_fail;
+	ltype = lua_type(L, i);
+	ltypename = lua_typename(L, ltype);
+	if (!ftype) {
+		lua_pushfstring(L, "cannot pass a lua %s to FFI function",
+				ltypename);
+		luaL_argerror(L, i, lua_tostring(L, -1));
+	}
+#define CHECK(T1, T2) if (T1 != T2) goto convert_fail;
 	switch (ltype) {
 		case LUA_TNIL: /* as NULL pointer */
 			CHECK(ftype, &ffi_type_pointer);
-			arg->ptr = NULL;
+			arg++->ptr = NULL;
 			break;
 		case LUA_TBOOLEAN:
 		case LUA_TNUMBER:
-			if (!ftype) /* default as int */
-				ftype = &ffi_type_sint;
 			if (!cast_lua_c(L, i, arg->data, ftype->type))
 				goto convert_fail;
+			arg += (ftype->size + sizeof (ffi_raw) - 1) / sizeof (ffi_raw);
 			break;
 		case LUA_TSTRING: /* as const char * */
 			CHECK(ftype, &ffi_type_pointer);
-			arg->ptr = (void *) lua_tostring(L, i);
+			arg++->ptr = (void *) lua_tostring(L, i);
 			break;
 		case LUA_TFUNCTION: /* as pointer */
 			CHECK(ftype, &ffi_type_pointer);
-			arg->ptr = (void *) lua_tocfunction(L, i);
-			if (!arg->ptr || lua_getupvalue(L, i, 1))
+			fn = (void *) lua_tocfunction(L, i);
+			if (!fn || lua_getupvalue(L, i, 1))
 				goto convert_fail;
+			arg++->ptr = fn;
 			break;
-
 		case LUA_TLIGHTUSERDATA:
 			CHECK(ftype, &ffi_type_pointer);
-			arg->ptr = lua_touserdata(L, i);
+			arg++->ptr = lua_touserdata(L, i);
 			break;
-
 		case LUA_TUSERDATA:
 			var = luaL_testudata(L, i, "ffi_cvar");
 			if (var->arraysize > 0) {
 				CHECK(ftype, &ffi_type_pointer);
-				arg->ptr = var->mem;
+				arg++->ptr = var->mem;
 			} else {
-				if (!ftype)
-					ftype = var->type;
 				if (!pusharg_cvar(arg, var, ftype))
 					goto convert_fail;
+				arg += (ftype->size + sizeof (ffi_raw) - 1) / sizeof (ffi_raw);
 			}
 			break;
-
+#undef CHECK
 		/* these cannot be converted */
 		case LUA_TTABLE:
 		case LUA_TTHREAD:
 		default:
 convert_fail:
-			ltypename = lua_typename(L, ltype);
-			if (ftype)
-				lua_pushfstring(L, "%s expected, got %s\n",
-						type_names[ftype->type],
-						ltypename);
-			else
-				lua_pushfstring(L, "cannot pass a lua %s "
-						"to FFI function",
-						ltypename);
+			lua_pushfstring(L, "expected %s, got %s\n",
+					type_names[ftype->type],
+					ltypename);
 			luaL_argerror(L, i, lua_tostring(L, -1));
 	}
-#undef CHECK
-	return ftype;
+	return arg;
 }
 
 static
@@ -215,51 +203,40 @@ ffi_type *get_ffi_type(lua_State *L, int i)
 	return type;
 }
 
-static struct cvar *makecvar_(lua_State *, ffi_type *, size_t);
-
-int funccall(lua_State *L)
+static
+ffi_type *populate_atype(lua_State *L, int i)
 {
-	/* (n) means the n-th upvalue */
-	lua_CFunction fn; /* (1) */
-	ffi_cif cif;
-	ffi_abi ABI; /* (2) */
-	ffi_raw *args;
-	ffi_type *rtype; /* (3) */
-	struct arglist *argl; /* (4) */
-	ffi_type **atypes;
-	ffi_arg rvalue;
-	ffi_status status;
-	unsigned int i, nargs, nfixed;
+	struct cvar *var;
+	int ltype;
 
-	nargs = lua_gettop(L);
-	args = alloca(sizeof (ffi_raw *) * nargs);
-
-	fn = lua_tocfunction(L, lua_upvalueindex(1));
-	ABI = (ffi_abi) lua_tointeger(L, lua_upvalueindex(2));
-	rtype = lua_touserdata(L, lua_upvalueindex(3));
-	argl = lua_touserdata(L, lua_upvalueindex(4));
-	if (argl) {
-		nfixed = argl->nargs;
-		atypes = argl->atypes;
-		if (nargs < nfixed || (!argl->variadic && nargs != nfixed))
-			return luaL_error(L, "need %d arguments, %d given",
-				(int) nfixed, (int) nargs);
-	} else {
-		nfixed = nargs;
-		atypes = alloca(sizeof (ffi_type *) * nargs);
+	ltype = lua_type(L, i);
+	switch (ltype) {
+		case LUA_TNIL: /* as NULL pointer */
+		case LUA_TSTRING: /* as const char * */
+		case LUA_TLIGHTUSERDATA:
+		case LUA_TFUNCTION: /* as pointer */
+			return &ffi_type_pointer;
+		case LUA_TBOOLEAN:
+		case LUA_TNUMBER: /* as int */
+			return &ffi_type_sint;
+		case LUA_TUSERDATA:
+			var = luaL_testudata(L, i, "ffi_cvar");
+			if (var)
+				return (var->arraysize == 0)
+					? var->type
+					: &ffi_type_pointer;
+			/* fallthrough */
+		/* cannot be passed to C function */
+		case LUA_TTABLE:
+		case LUA_TTHREAD:
+		default:
+			return 0;
 	}
+}
 
-	for (i = 0; i < nargs; i++) {
-		if (argl && i < nfixed)
-			pusharg(L, i, args, atypes[i]);
-		else
-			atypes[i] = pusharg(L, i, args, 0);
-	}
-
-	if (nfixed == nargs)
-		status = ffi_prep_cif(&cif, ABI, nargs, rtype, atypes);
-	else
-		status = ffi_prep_cif_var(&cif, ABI, nfixed, nargs, rtype, atypes);
+static
+void check_status(lua_State *L, int status)
+{
 	if (status != FFI_OK) {
 		const char *status_name = 0;
 
@@ -269,10 +246,68 @@ int funccall(lua_State *L)
 			case FFI_BAD_ABI: status_name = "FFI_BAD_ABI"; break;
 		}
 
-		return luaL_error(L, "libffi error: %s", status_name);
+		luaL_error(L, "libffi error: %s", status_name);
 	}
-	fprintf(stderr, "FFI: cif->size = %u, sizeof args = %u\n",
-		(unsigned) cif.bytes, (unsigned) sizeof (ffi_raw *) * nargs);
+}
+
+static struct cvar *makecvar_(lua_State *, ffi_type *, size_t);
+
+int funccall(lua_State *L)
+{
+	/* (n) means the n-th upvalue */
+	lua_CFunction fn; /* (1) */
+	ffi_cif cif;
+	ffi_abi ABI; /* (2) */
+	ffi_raw *args, *parg;
+	ffi_type *rtype; /* (3) */
+	struct arglist *argl; /* (4) */
+	ffi_type **atypes;
+	ffi_arg rvalue;
+	ffi_status status;
+	unsigned int i, nargs, nfixed;
+
+	nargs = lua_gettop(L);
+
+	fn = lua_tocfunction(L, lua_upvalueindex(1));
+	ABI = (ffi_abi) lua_tointeger(L, lua_upvalueindex(2));
+	rtype = lua_touserdata(L, lua_upvalueindex(3));
+	argl = lua_touserdata(L, lua_upvalueindex(4));
+	if (argl) {
+		nfixed = argl->nargs;
+		if (!argl->variadic) {
+			if (nargs != nfixed) goto arg_error;
+			atypes = argl->atypes;
+		} else {
+			if (nargs < nfixed)
+arg_error:
+				return luaL_error(L, "need %d arguments, %d given",
+					(int) nfixed, (int) nargs);
+			atypes = alloca(sizeof (ffi_type *) * nargs);
+			memcpy(atypes, argl->atypes, sizeof (ffi_type *) * nfixed);
+			for (i = nfixed; i < nargs; i++)
+				atypes[i] = populate_atype(L, i + 1);
+		}
+	} else { /* no argument info is given */
+		nfixed = nargs;
+		atypes = alloca(sizeof (ffi_type *) * nargs);
+		for (i = 0; i < nargs; i++)
+			atypes[i] = populate_atype(L, i + 1);
+	}
+
+	if (nfixed == nargs)
+		status = ffi_prep_cif(&cif, ABI, nargs, rtype, atypes);
+	else
+		status = ffi_prep_cif_var(&cif, ABI, nfixed, nargs, rtype, atypes);
+
+	check_status(L, status);
+
+	parg = args = alloca(cif.bytes);
+	for (i = 0; i < nargs; i++) {
+		parg = pusharg(L, i+1, parg, atypes[i]);
+	}
+	//fprintf(stderr, "FFI: cif->size = %u, filled args = %u\n",
+	//	(unsigned) cif.bytes, (unsigned) (sizeof (ffi_raw *) * (parg - args)));
+
 	/* FIXME large return values? */
 	if (rtype->size <= sizeof rvalue) {
 		ffi_raw_call(&cif, FFI_FN(fn), &rvalue, args);
