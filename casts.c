@@ -6,7 +6,6 @@ static
 int cast_int_c(lua_Integer n, void *addr, int type)
 {
 	switch (type) {
-		case FFI_TYPE_INT: *(int *) addr = n; break;
 		case FFI_TYPE_UINT8: *(uint8_t *) addr = n; break;
 		case FFI_TYPE_UINT16: *(uint16_t *) addr = n; break;
 		case FFI_TYPE_UINT32: *(uint32_t *) addr = n; break;
@@ -31,7 +30,6 @@ static
 int cast_number_c(lua_Number n, void *addr, int type)
 {
 	switch (type) {
-		case FFI_TYPE_INT: *(int *) addr = n; break;
 		case FFI_TYPE_UINT8: *(uint8_t *) addr = n; break;
 		case FFI_TYPE_UINT16: *(uint16_t *) addr = n; break;
 		case FFI_TYPE_UINT32: *(uint32_t *) addr = n; break;
@@ -68,7 +66,6 @@ int cast_c_lua(lua_State *L, void *addr, int type)
 	void *p;
 
 	switch (type) {
-		case FFI_TYPE_INT: i = *(int *) addr; goto cast_int;
 		case FFI_TYPE_UINT8: i = *(uint8_t *) addr; goto cast_int;
 		case FFI_TYPE_UINT16: i = *(uint16_t *) addr; goto cast_int;
 		case FFI_TYPE_UINT32: i = *(uint32_t *) addr; goto cast_int;
