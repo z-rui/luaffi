@@ -258,30 +258,17 @@ arg_error:
 	args = alloca(sizeof (void *) * nargs);
 	for (i = 0; i < nargs; i++) {
 		ffi_type *ftype;
-		int type, ltype;
-		int rc = 0;
 
 		ftype = atypes[i];
-		type = ftype->type;
-		ltype = lua_type(L, i+2); /* i+2 is the position of the argument on lua stack */
-		if (type == FFI_TYPE_POINTER) {
-			args[i] = alloca(sizeof (void *));
-			rc = cast_lua_pointer(L, i+2, (void **) args[i]);
-		} else if (TYPE_IS_INT(type) || TYPE_IS_FLOAT(type)) {
-			args[i] = alloca(sizeof (ftype->size));
-			rc = cast_lua_c(L, i+2, args[i], type);
-		}
-		if (!rc) {
-			return luaL_error(L, "cannot convert %s to %s",
-				lua_typename(L, ltype), type_names[type]);
-		}
+		args[i] = alloca(sizeof (ftype->size));
+		cast_lua_c(L, i+2, args[i], ftype->type);
 	}
 
-	/* FIXME large return values? */
 	if (func->rtype->size <= sizeof rvalue) {
 		ffi_call(&cif, FFI_FN(func->fn), &rvalue, args);
 		return cast_c_lua(L, &rvalue, func->rtype->type);
 	} else {
+		/* TODO move this to cast_c_lua? */
 		struct cvar *var = makecvar_(L, func->rtype, 0);
 		ffi_call(&cif, FFI_FN(func->fn), var->mem, args);
 	}
@@ -396,15 +383,7 @@ int makecvar(lua_State *L)
 	arraysize = lua_tointeger(L, lua_upvalueindex(2));
 	var = makecvar_(L, type, arraysize);
 	if (!arraysize && lua_gettop(L) >= 1) {
-		if (type->type == FFI_TYPE_POINTER) {
-			if (!cast_lua_pointer(L, 1, (void **) var->mem))
-				goto fail;
-		} else if (!cast_lua_c(L, 1, var->mem, type->type)) {
-fail:
-			luaL_error(L, "cannot convert %s to %s",
-				lua_typename(L, lua_type(L, 1)),
-				type_names[type->type]);
-		}
+		cast_lua_c(L, 1, var->mem, type->type);
 	} else {
 		memset(var->mem, 0, type->size * arraysize);
 	}
@@ -449,10 +428,7 @@ int c_newindex(lua_State *L)
 	int type;
 
 	addr = index2addr(L, &type);
-	if (!cast_lua_c(L, 3, addr, type))
-		return luaL_error(L, "cannot convert %s to %s",
-			lua_typename(L, lua_type(L, 3)),
-			type_names[type]);
+	cast_lua_c(L, 3, addr, type);
 	return 1;
 }
 
@@ -481,11 +457,9 @@ int c_tostr(lua_State *L)
 			lua_pushfstring(L, "array: %p", var->mem);
 		}
 	} else {
-		if (cast_c_lua(L, var->mem, type)) {
-			lua_tostring(L, -1);
-		} else {
-			lua_pushfstring(L, "%s: %p", type_names[type], var->mem);
-		}
+		/* currently cast_c_lua never fails... */
+		cast_c_lua(L, var->mem, type);
+		lua_tostring(L, -1);
 	}
 	return 1;
 }
@@ -509,9 +483,8 @@ int c_ptrderef(lua_State *L)
 	size_t offset;
 	size_t elemsize;
 
-	cast_lua_pointer(L, 1, &ptr);
-	if (!ptr) /* not a pointer, or NULL */
-		return luaL_error(L, "invalid pointer");
+	if (!cast_lua_pointer(L, 1, &ptr))
+		return luaL_argerror(L, 1, "expect a pointer");
 	type = type_info(L, 2, &arraysize);
 	luaL_argcheck(L, type, 2, "expect FFI type");
 	lua_pop(L, 1);
@@ -540,8 +513,7 @@ int c_tonum(lua_State *L)
 	if (TYPE_IS_INT(type) || TYPE_IS_FLOAT(type)) {
 		cast_c_lua(L, var->mem, type); /* must success */
 	} else if (type == FFI_TYPE_POINTER) {
-		void **pp = (void *) var->mem;
-		lua_pushinteger(L, (lua_Integer) *pp);
+		lua_pushinteger(L, (lua_Integer) *var->mem);
 	} else {
 		lua_pushnil(L);
 	}
@@ -586,7 +558,7 @@ void cl_proxy(ffi_cif *cif, void *ret, void *args[], void *ud)
 	int rtype;
 
 	if (!lua_checkstack(L, nargs + 1))
-		luaL_error(L, "C stack overflow");
+		luaL_error(L, "C stack overflow"); /* sorry... */
 	lua_rawgeti(L, LUA_REGISTRYINDEX, cl->ref);
 	luaL_checktype(L, -1, LUA_TFUNCTION);
 	/* push arguments */
@@ -595,8 +567,10 @@ void cl_proxy(ffi_cif *cif, void *ret, void *args[], void *ud)
 	}
 	lua_call(L, nargs, 1);
 	rtype = cif->rtype->type;
-	/* XXX is it allowed to raise? */
-	cast_lua_c(L, -1, ret, rtype);
+	if (rtype != FFI_TYPE_VOID) {
+		/* XXX is it OK to raise if conversion failed? */
+		cast_lua_c(L, -1, ret, rtype);
+	}
 	lua_pop(L, 1); /* pop return value from lua stack */
 }
 

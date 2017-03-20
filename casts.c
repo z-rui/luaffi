@@ -114,23 +114,32 @@ int cast_lua_c(lua_State *L, int i, void *addr, int type)
 {
 	struct cvar *var;
 	int ltype;
+	int rc = 0;
 
 	ltype = lua_type(L, i);
-	switch (ltype) {
-		case LUA_TBOOLEAN:
-			return cast_int_c(lua_toboolean(L, i), addr, type);
-		case LUA_TNUMBER:
-			return (lua_isinteger(L, i))
-				? cast_int_c(lua_tointeger(L, i), addr, type)
-				: cast_number_c(lua_tonumber(L, i), addr, type);
-		case LUA_TUSERDATA:
-			var = luaL_checkudata(L, i, "ffi_cvar");
-			if (!var || type != var->type->type)
-				return 0;
-			memcpy(addr, var->mem, var->type->size);
-			return 1;
+	if (type == FFI_TYPE_POINTER) { /* pointer type is a special case */
+		rc = cast_lua_pointer(L, i, (void **) addr);
+	/* all below is dealing with value type */
+	} else if (ltype == LUA_TBOOLEAN) {
+		rc = cast_int_c(lua_toboolean(L, i), addr, type);
+	} else if (ltype == LUA_TNUMBER) {
+		rc = (lua_isinteger(L, i))
+			? cast_int_c(lua_tointeger(L, i), addr, type)
+			: cast_number_c(lua_tonumber(L, i), addr, type);
+	} else if (ltype == LUA_TUSERDATA) {
+		var = luaL_checkudata(L, i, "ffi_cvar");
+		if (!var || type != var->type->type)
+			return 0;
+		memcpy(addr, var->mem, var->type->size);
+		rc = 1;
 	}
-	return 0;
+	if (rc == 0) {
+		lua_pushfstring(L, "expect %s, got %s",
+			lua_typename(L, ltype),
+			type_names[type]);
+		luaL_argerror(L, i, lua_tostring(L, -1));
+	}
+	return rc;
 }
 
 static
@@ -166,7 +175,12 @@ cast_num:
 				lua_pushlightuserdata(L, p);
 			break;
 
-		default: return 0;
+		default:
+			/* To be consistent, always push a value
+			 * on to the stack.  If we are going to
+			 * support STRUCT etc., it's probably
+			 * OK to call makecvar_ here */
+			lua_pushnil(L);
 	}
 	return 1;
 }
