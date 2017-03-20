@@ -23,6 +23,14 @@ struct cfunc {
 	int variadic;
 };
 
+struct closure {
+	lua_State *L;
+	ffi_closure *cl;
+	ffi_cif cif;
+	void *addr;
+	int ref; /* ref of lua cl */
+};
+
 static
 int callloadlib(lua_State *L)
 {
@@ -126,12 +134,18 @@ static
 ffi_type *type_info(lua_State *L, int i, size_t *arraysize)
 {
 	int rc;
+	size_t asize;
 
 	if (!lua_getupvalue(L, i, 2))
 		return 0;
-	*arraysize = (size_t) lua_tointegerx(L, -1, &rc);
-	lua_pop(L, 1); /* pop arraysize */
+	asize = (size_t) lua_tointegerx(L, -1, &rc);
 	if (!rc) return 0;
+	lua_pop(L, 1); /* pop arraysize */
+	if (arraysize)
+		*arraysize = asize;
+	else if (asize > 0)
+		luaL_argerror(L, i, "expect a non-array");
+
 	if (lua_getupvalue(L, i, 1)) {
 		/* assume an ffi_type* */
 		/* cannot pop from stack as this
@@ -382,7 +396,15 @@ int makecvar(lua_State *L)
 	arraysize = lua_tointeger(L, lua_upvalueindex(2));
 	var = makecvar_(L, type, arraysize);
 	if (!arraysize && lua_gettop(L) >= 1) {
-		cast_lua_c(L, 1, var->mem, type->type);
+		if (type->type == FFI_TYPE_POINTER) {
+			if (!cast_lua_pointer(L, 1, (void **) var->mem))
+				goto fail;
+		} else if (!cast_lua_c(L, 1, var->mem, type->type)) {
+fail:
+			luaL_error(L, "cannot convert %s to %s",
+				lua_typename(L, lua_type(L, 1)),
+				type_names[type->type]);
+		}
 	} else {
 		memset(var->mem, 0, type->size * arraysize);
 	}
@@ -505,6 +527,27 @@ int c_ptrstr(lua_State *L)
 	return 1;
 }
 #endif
+static
+int c_ptrderef(lua_State *L)
+{
+	void *ptr;
+	ffi_type *type;
+	size_t offset;
+	size_t elemsize;
+
+	cast_lua_pointer(L, 1, &ptr);
+	if (!ptr) /* not a pointer, or NULL */
+		return luaL_error(L, "invalid pointer");
+	type = type_info(L, 2, 0);
+	luaL_argcheck(L, type, 2, "expect FFI type");
+	lua_pop(L, 1);
+	offset = (size_t) luaL_optinteger(L, 3, 0);
+	if (lua_isnoneornil(L, 4))
+		elemsize = type->size;
+	else
+		elemsize = (size_t) luaL_checkinteger(L, 4);
+	return cast_c_lua(L, (char *) ptr + offset * elemsize, type->type);
+}
 
 static
 int c_tonum(lua_State *L)
@@ -554,6 +597,125 @@ int struct_t(lua_State *L)
 #endif
 
 static
+void cl_proxy(ffi_cif *cif, void *ret, void *args[], void *ud)
+{
+	struct closure *cl = (struct closure *) ud;
+	lua_State *L = cl->L;
+	unsigned nargs = cif->nargs;
+	unsigned i;
+	int rtype;
+
+	if (!lua_checkstack(L, nargs + 1))
+		luaL_error(L, "C stack overflow");
+	int top = lua_gettop(L);
+	fprintf(stderr, "FFI: before push, top = %d\n", top);
+	lua_rawgeti(L, LUA_REGISTRYINDEX, cl->ref);
+	luaL_checktype(L, -1, LUA_TFUNCTION);
+	/* push arguments */
+	for (i = 0; i < nargs; i++) {
+		cast_c_lua(L, args[i], cif->arg_types[i]->type);
+	}
+	top = lua_gettop(L);
+	fprintf(stderr, "FFI: before call, top = %d\n", top);
+	lua_call(L, nargs, 1);
+	top = lua_gettop(L);
+	fprintf(stderr, "FFI: after call, top = %d\n", top);
+	fprintf(stderr, "FFI: return type = %s\n", lua_typename(L, lua_type(L, top)));
+	rtype = cif->rtype->type;
+	/* XXX is it allowed to raise? */
+	cast_lua_c(L, -1, ret, rtype);
+	lua_pop(L, 1); /* pop return value from lua stack */
+}
+
+static
+int cl_tostr(lua_State *L)
+{
+	struct closure *cl;
+
+	cl = luaL_checkudata(L, 1, "ffi_closure");
+	lua_pushfstring(L, "FFI closure: %p", cl->addr);
+	return 1;
+}
+
+static
+int cl_gc(lua_State *L)
+{
+	struct closure *cl;
+
+	cl = luaL_checkudata(L, 1, "ffi_closure");
+	if (cl->cl) {
+		ffi_closure_free(cl->cl);
+		cl->cl = 0;
+	}
+	luaL_unref(cl->L, LUA_REGISTRYINDEX, cl->ref);
+	cl->ref = LUA_NOREF;
+	return 0;
+}
+
+#if 1
+static
+int cl_call(lua_State *L)
+{
+	struct closure *cl;
+	int n;
+
+	cl = luaL_checkudata(L, 1, "ffi_closure");
+	n = ((int (*)(int, int)) cl->addr)(1, 2);
+	printf("1 + 2 = %d\n", n);
+	return 0;
+}
+#endif
+
+static
+int makeclosure(lua_State *L)
+{
+	struct closure *cl;
+	int nargs, i;
+	ffi_type **atypes;
+	ffi_type *rtype;
+	ffi_status status;
+
+	/* limitation: rtype has to be light userdata */
+	if (lua_isnil(L, 1)) {
+		rtype = &ffi_type_void;
+	} else {
+		rtype = type_info(L, 1, 0);
+		luaL_argcheck(L, rtype, 1, "expect FFI type");
+		lua_pop(L, 1); /* ffi_type* */
+	}
+
+	luaL_checktype(L, 2, LUA_TFUNCTION);
+	nargs = lua_gettop(L) - 2;
+
+	cl = lua_newuserdata(L, sizeof (struct closure));
+	cl->L = L;
+	cl->cl = 0;
+	cl->addr = 0;
+	cl->ref = LUA_NOREF;
+	luaL_setmetatable(L, "ffi_closure");
+
+
+	atypes = lua_newuserdata(L, sizeof (ffi_type *) * nargs);
+	lua_setuservalue(L, -2); /* reference it */
+	for (i = 0; i < nargs; i++) {
+		ffi_type *type = type_info(L, i+3, 0);
+		luaL_argcheck(L, type, i+3, "expect FFI type");
+		atypes[i] = type; /* XXX not referencing */
+		lua_pop(L, 1); /* ffi_type* */
+	}
+	status = ffi_prep_cif(&cl->cif, FFI_DEFAULT_ABI, nargs, rtype, atypes);
+	check_status(L, status);
+	cl->cl = ffi_closure_alloc(sizeof (ffi_closure), &cl->addr);
+	if (!cl->cl)
+		return luaL_error(L, "allocating closure failed");
+	status = ffi_prep_closure_loc(cl->cl, &cl->cif, cl_proxy, cl, cl->addr);
+	check_status(L, status);
+	lua_pushvalue(L, 2); /* the lua closure */
+	cl->ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	return 1;
+}
+
+static
 luaL_Reg ffilib[] = {
 	{"addr", c_addr},
 	{"argtype", argtype},
@@ -561,6 +723,8 @@ luaL_Reg ffilib[] = {
 #if 0
 	{"ptrstr", c_ptrstr},
 #endif
+	{"deref", c_ptrderef},
+	{"closure", makeclosure},
 	{"restype", restype},
 	{"sizeof", c_sizeof},
 	{"tonumber", c_tonum},
@@ -657,6 +821,16 @@ int luaopen_ffi(lua_State *L)
 	lua_setfield(L, -2, "__tostring");
 	lua_pushcfunction(L, funccall);
 	lua_setfield(L, -2, "__call");
+
+	luaL_newmetatable(L, "ffi_closure");
+	lua_pushcfunction(L, cl_tostr);
+	lua_setfield(L, -2, "__tostring");
+	lua_pushcfunction(L, cl_gc);
+	lua_setfield(L, -2, "__gc");
+#if 1
+	lua_pushcfunction(L, cl_call);
+	lua_setfield(L, -2, "__call");
+#endif
 
 	luaL_newlib(L, ffilib);
 	lua_pushvalue(L, loadfunc);

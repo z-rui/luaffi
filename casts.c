@@ -10,6 +10,7 @@ int cast_lua_pointer(lua_State *L, int i, void **pp)
 	const char *name;
 	struct cvar *var;
 	struct cfunc *func;
+	struct closure *cl;
 
 	ltype = lua_type(L, i);
 	switch (ltype) {
@@ -49,6 +50,9 @@ int cast_lua_pointer(lua_State *L, int i, void **pp)
 			} else if (strcmp(name, "ffi_cfunc") == 0) {
 				func = lua_touserdata(L, i);
 				*pp = (void *) func->fn;
+			} else if (strcmp(name, "ffi_closure") == 0) {
+				cl = lua_touserdata(L, i);
+				*pp = (void *) cl->addr;
 			} else {
 				goto fail;
 			}
