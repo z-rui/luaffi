@@ -500,45 +500,19 @@ int f_tostr(lua_State *L)
 	return 1;
 }
 
-#if 0
-static
-int c_ptrstr(lua_State *L)
-{
-	struct cvar *var;
-	int type;
-	void *base;
-
-	if (lua_islightuserdata(L, 1)) {
-		base = lua_touserdata(L, 1);
-	} else {
-		var = luaL_checkudata(L, 1, "ffi_cvar");
-		type = var->type->type;
-		typename = type_names[type];
-		if (var->arraysize > 0) {
-			base = var->mem;
-		} else if (type == FFI_TYPE_POINTER) {
-			void **pp = (void *) var->mem;
-			base = *pp;
-		} else {
-			return luaL_error(L, "expect a pointer or array");
-		}
-	}
-	lua_pushstring(L, base);
-	return 1;
-}
-#endif
 static
 int c_ptrderef(lua_State *L)
 {
 	void *ptr;
 	ffi_type *type;
+	size_t arraysize;
 	size_t offset;
 	size_t elemsize;
 
 	cast_lua_pointer(L, 1, &ptr);
 	if (!ptr) /* not a pointer, or NULL */
 		return luaL_error(L, "invalid pointer");
-	type = type_info(L, 2, 0);
+	type = type_info(L, 2, &arraysize);
 	luaL_argcheck(L, type, 2, "expect FFI type");
 	lua_pop(L, 1);
 	offset = (size_t) luaL_optinteger(L, 3, 0);
@@ -546,7 +520,13 @@ int c_ptrderef(lua_State *L)
 		elemsize = type->size;
 	else
 		elemsize = (size_t) luaL_checkinteger(L, 4);
-	return cast_c_lua(L, (char *) ptr + offset * elemsize, type->type);
+	ptr = (char *) ptr + offset * elemsize;
+	if (arraysize) {
+		struct cvar *var = makecvar_(L, type, arraysize);
+		memcpy(var->mem, ptr, type->size * arraysize);
+		return 1;
+	}
+	return cast_c_lua(L, ptr, type->type);
 }
 
 static
