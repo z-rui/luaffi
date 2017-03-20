@@ -137,9 +137,9 @@ ffi_type *type_info(lua_State *L, int i, size_t *arraysize)
 	size_t asize;
 
 	if (!lua_getupvalue(L, i, 2))
-		return 0;
+		goto fail;
 	asize = (size_t) lua_tointegerx(L, -1, &rc);
-	if (!rc) return 0;
+	if (!rc) goto fail;
 	lua_pop(L, 1); /* pop arraysize */
 	if (arraysize)
 		*arraysize = asize;
@@ -152,6 +152,8 @@ ffi_type *type_info(lua_State *L, int i, size_t *arraysize)
 		 * may not be a lightuserdata */
 		return lua_touserdata(L, -1);
 	}
+fail:
+	luaL_argerror(L, i, "expect an FFI type");
 	return 0;
 }
 
@@ -289,8 +291,6 @@ int c_sizeof(lua_State *L)
 		type = type_info(L, 1, &arraysize);
 	}
 
-	luaL_argcheck(L, type, 1, "expect type or FFI object");
-
 	size = type->size;
 	if (arraysize > 0)
 		size *= arraysize;
@@ -309,10 +309,7 @@ int restype(lua_State *L)
 	if (lua_isnil(L, 2)) {
 		type = &ffi_type_void;
 	} else {
-		size_t arraysize;
-		type = type_info(L, 2, &arraysize);
-		luaL_argcheck(L, type && arraysize == 0, 2,
-			"expect a non-array FFI type");
+		type = type_info(L, 2, 0);
 	}
 	func->rtype = type;
 	return 0;
@@ -326,7 +323,6 @@ int argtype(lua_State *L)
 	struct arglist *argl;
 	ffi_type *type;
 	ffi_type **atypes;
-	size_t arraysize;
 	int i;
 
 	func = luaL_checkudata(L, 1, "ffi_cfunc");
@@ -347,9 +343,7 @@ int argtype(lua_State *L)
 			func->variadic = 1;
 			break;
 		}
-		type = type_info(L, i+2, &arraysize);
-		luaL_argcheck(L, type && arraysize == 0, 2,
-			"expect a non-array FFI type");
+		type = type_info(L, i+2, 0);
 		atypes[i] = type; /* XXX not referencing */
 		lua_pop(L, 1); /* ffi_type* */
 	}
@@ -382,7 +376,7 @@ int makecvar(lua_State *L)
 	type = lua_touserdata(L, lua_upvalueindex(1));
 	arraysize = lua_tointeger(L, lua_upvalueindex(2));
 	var = makecvar_(L, type, arraysize);
-	if (!arraysize && lua_gettop(L) >= 1) {
+	if (lua_gettop(L) >= 1) {
 		cast_lua_c(L, 1, var->mem, type->type);
 	} else {
 		memset(var->mem, 0, type->size * arraysize);
@@ -486,7 +480,6 @@ int c_ptrderef(lua_State *L)
 	if (!cast_lua_pointer(L, 1, &ptr))
 		return luaL_argerror(L, 1, "expect a pointer");
 	type = type_info(L, 2, &arraysize);
-	luaL_argcheck(L, type, 2, "expect FFI type");
 	lua_pop(L, 1);
 	offset = (size_t) luaL_optinteger(L, 3, 0);
 	if (lua_isnoneornil(L, 4))
@@ -523,13 +516,10 @@ int c_tonum(lua_State *L)
 static
 int array(lua_State *L)
 {
-	ffi_type *type;
 	lua_Integer size;
 	size_t arraysize;
 
-	type = type_info(L, 1, &arraysize);
-	luaL_argcheck(L, type && arraysize == 0, 1,
-			"expect a non-array FFI type");
+	type_info(L, 1, &arraysize);
 	size = luaL_checkinteger(L, 2);
 	luaL_argcheck(L, size > 0, 2, "expect a positive size");
 	/* stack top is ffi_type* (pushed by type_info) */
@@ -590,6 +580,7 @@ int cl_gc(lua_State *L)
 	struct closure *cl;
 
 	cl = luaL_checkudata(L, 1, "ffi_closure");
+	fprintf(stderr, "FFI: gc is called on %p\n", cl->cl);
 	if (cl->cl) {
 		ffi_closure_free(cl->cl);
 		cl->cl = 0;
@@ -613,7 +604,6 @@ int makeclosure(lua_State *L)
 		rtype = &ffi_type_void;
 	} else {
 		rtype = type_info(L, 1, 0);
-		luaL_argcheck(L, rtype, 1, "expect FFI type");
 		lua_pop(L, 1); /* ffi_type* */
 	}
 
@@ -632,7 +622,6 @@ int makeclosure(lua_State *L)
 	lua_setuservalue(L, -2); /* reference it */
 	for (i = 0; i < nargs; i++) {
 		ffi_type *type = type_info(L, i+3, 0);
-		luaL_argcheck(L, type, i+3, "expect FFI type");
 		atypes[i] = type; /* XXX not referencing */
 		lua_pop(L, 1); /* ffi_type* */
 	}
@@ -740,6 +729,10 @@ int luaopen_ffi(lua_State *L)
 	lua_setfield(L, -2, "__index");
 	lua_pushliteral(L, "v"); /* weak value table */
 	lua_setfield(L, -2, "__mode");
+
+	luaL_newmetatable(L, "ffi_ctype");
+	lua_pushcfunction(L, makecvar);
+	lua_setfield(L, -2, "__call");
 	
 	luaL_newmetatable(L, "ffi_cvar");
 	lua_pushcfunction(L, c_tostr);

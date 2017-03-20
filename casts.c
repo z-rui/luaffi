@@ -128,10 +128,10 @@ int cast_lua_c(lua_State *L, int i, void *addr, int type)
 			: cast_number_c(lua_tonumber(L, i), addr, type);
 	} else if (ltype == LUA_TUSERDATA) {
 		var = luaL_checkudata(L, i, "ffi_cvar");
-		if (!var || type != var->type->type)
-			return 0;
-		memcpy(addr, var->mem, var->type->size);
-		rc = 1;
+		if (var && type == var->type->type) {
+			memcpy(addr, var->mem, var->type->size * var->arraysize);
+			rc = 1;
+		}
 	}
 	if (rc == 0) {
 		lua_pushfstring(L, "expect %s, got %s",
