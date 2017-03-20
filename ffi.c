@@ -11,7 +11,7 @@
 struct cvar {
 	ffi_type *type;
 	size_t arraysize;
-	char mem[0];
+	void *mem[0];
 };
 
 struct cfunc {
@@ -476,7 +476,7 @@ int c_tostr(lua_State *L)
 	type = var->type->type;
 	if (var->arraysize > 0) {
 		if (type == FFI_TYPE_UINT8 || type == FFI_TYPE_SINT8) {
-			lua_pushlstring(L, var->mem, var->arraysize);
+			lua_pushlstring(L, (char *) var->mem, var->arraysize);
 		} else {
 			lua_pushfstring(L, "array: %p", var->mem);
 		}
