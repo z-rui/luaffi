@@ -3,6 +3,52 @@
 #include <stdint.h>
 
 static
+int cast_lua_pointer(lua_State *L, int i, void **pp, ffi_type *ftype)
+{
+	int ltype;
+	lua_CFunction fn;
+	struct cvar *var;
+
+	ltype = lua_type(L, i);
+	switch (ltype) {
+		case LUA_TNIL:
+			*pp = 0;
+			break;
+		case LUA_TNUMBER:
+			*pp = (void *) luaL_checkinteger(L, i);
+			break;
+		case LUA_TSTRING:
+			/* FFI discards the `const' qualifier;
+			 * the C function must not change the string. */
+			*pp = (void *) lua_tostring(L, i);
+			break;
+		case LUA_TFUNCTION:
+			fn = lua_tocfunction(L, i);
+			if (!fn || lua_getupvalue(L, i, 1))
+				return 0; /* don't support C closure yet */
+			*pp = (void *) fn;
+			break;
+		case LUA_TLIGHTUSERDATA:
+			*pp = lua_touserdata(L, i);
+			break;
+		case LUA_TUSERDATA:
+			var = luaL_testudata(L, i, "ffi_cvar");
+			if (var->arraysize > 0) {
+				*pp = (void *) var->mem;
+			} else if (ftype == var->type) {
+				/* XXX: C -> C cast is not supported */
+				*pp = (void *) var->mem;
+			} else {
+				return 0;
+			}
+			break;
+		default:
+			return 0;
+	}
+	return 1;
+}
+
+static
 int cast_int_c(lua_Integer n, void *addr, int type)
 {
 	switch (type) {
@@ -18,8 +64,6 @@ int cast_int_c(lua_Integer n, void *addr, int type)
 		case FFI_TYPE_FLOAT: *(float *) addr = n; break;
 		case FFI_TYPE_DOUBLE: *(double *) addr = n; break;
 		case FFI_TYPE_LONGDOUBLE: *(long double *) addr = n; break;
-
-		case FFI_TYPE_POINTER: *(void **) addr = (void *) n; break;
 
 		default: return 0;
 	}
@@ -49,7 +93,7 @@ int cast_number_c(lua_Number n, void *addr, int type)
 }
 
 static
-int cast_lua_c(lua_State *L, int i, void *addr, int type)
+int cast_lua_number(lua_State *L, int i, void *addr, int type)
 {
 	if (lua_isboolean(L, i))
 		return cast_int_c(lua_toboolean(L, i), addr, type);

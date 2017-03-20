@@ -113,86 +113,6 @@ static const char *type_names[] = {
 #include "casts.c"
 
 static
-ffi_raw *pusharg(lua_State *L, int i, ffi_raw *arg, ffi_type *ftype)
-{
-	int ltype;
-	const char *ltypename;
-	struct cvar *var;
-	void *fn;
-
-	ltype = lua_type(L, i);
-	ltypename = lua_typename(L, ltype);
-#define CHECK(T1, T2) if (T1 != T2) goto convert_fail;
-	switch (ltype) {
-		case LUA_TNIL: /* as NULL pointer */
-			CHECK(ftype, &ffi_type_pointer);
-			arg->ptr = NULL;
-			break;
-		case LUA_TBOOLEAN:
-		case LUA_TNUMBER:
-			if (!cast_lua_c(L, i, arg->data, ftype->type))
-				goto convert_fail;
-			break;
-		case LUA_TSTRING: /* as const char * */
-			CHECK(ftype, &ffi_type_pointer);
-			arg->ptr = (void *) lua_tostring(L, i);
-			break;
-		case LUA_TFUNCTION: /* as pointer */
-			CHECK(ftype, &ffi_type_pointer);
-			fn = (void *) lua_tocfunction(L, i);
-			if (!fn || lua_getupvalue(L, i, 1))
-				goto convert_fail;
-			arg->ptr = fn;
-			break;
-		case LUA_TLIGHTUSERDATA:
-			CHECK(ftype, &ffi_type_pointer);
-			arg->ptr = lua_touserdata(L, i);
-			break;
-		case LUA_TUSERDATA:
-			var = luaL_testudata(L, i, "ffi_cvar");
-			if (var->arraysize > 0) {
-				CHECK(ftype, &ffi_type_pointer);
-				arg->ptr = var->mem;
-			} else {
-				/* XXX: C -> C cast is not supported */
-				if (ftype == var->type) {
-					if (ftype->type == FFI_TYPE_STRUCT) {
-						/* TODO struct is not supported yet */
-						/* the raw API expects an pointer to
-						 * the struct */
-						arg->ptr = var->mem;
-						return arg + 1;
-					}
-					memcpy(arg->data, var->mem, ftype->size);
-				} else {
-					ltypename = type_names[var->type->type];
-					goto convert_fail;
-				}
-			}
-			break;
-#undef CHECK
-		/* these cannot be converted */
-		case LUA_TTABLE:
-		case LUA_TTHREAD:
-		default:
-convert_fail:
-			lua_pushfstring(L, "expected %s, got %s\n",
-					type_names[ftype->type],
-					ltypename);
-			luaL_argerror(L, i, lua_tostring(L, -1));
-	}
-	{
-		size_t size = ftype->size;
-		arg++;
-		while (size > sizeof (ffi_raw)) {
-			arg++;
-			size -= sizeof (ffi_raw);
-		}
-	}
-	return arg;
-}
-
-static
 ffi_type *type_info(lua_State *L, int i, size_t *arraysize)
 {
 	int rc;
@@ -212,15 +132,13 @@ ffi_type *type_info(lua_State *L, int i, size_t *arraysize)
 }
 
 static
-size_t populate_atypes(lua_State *L, ffi_type **atypes, int begin, int end)
+void populate_atypes(lua_State *L, ffi_type **atypes, int begin, int end)
 {
 	struct cvar *var;
 	int i;
 	int ltype;
-	size_t size = 0, size1;
 
-	for (i = 0; i < end; i++) {
-		if (i < begin) goto inc_size; /* type is given */
+	for (i = begin; i < end; i++) {
 		ltype = lua_type(L, i+1);
 		switch (ltype) {
 			case LUA_TNIL: /* as NULL pointer */
@@ -236,9 +154,11 @@ size_t populate_atypes(lua_State *L, ffi_type **atypes, int begin, int end)
 			case LUA_TUSERDATA:
 				var = luaL_testudata(L, i+1, "ffi_cvar");
 				if (var) {
-					atypes[i] =  (var->arraysize == 0)
-						? var->type
-						: &ffi_type_pointer;
+					if (var->arraysize > 0) {
+						atypes[i] = &ffi_type_pointer;
+					} else {
+						atypes[i] = var->type;
+					}
 					break;
 				}
 				/* fallthrough */
@@ -250,14 +170,7 @@ size_t populate_atypes(lua_State *L, ffi_type **atypes, int begin, int end)
 						lua_typename(L, ltype));
 				luaL_argerror(L, i, lua_tostring(L, -1));
 		}
-inc_size:
-		size1 = atypes[i]->size;
-		size++;
-		while (size1 > sizeof (ffi_raw)) {
-			size++; size1 -= sizeof (ffi_raw);
-		}
 	}
-	return size;
 }
 
 static
@@ -284,8 +197,7 @@ int funccall(lua_State *L)
 	lua_CFunction fn; /* (1) */
 	ffi_cif cif;
 	ffi_abi ABI; /* (2) */
-	ffi_raw *args, *parg;
-	size_t nraw;
+	void **args;
 	ffi_type *rtype; /* (3) */
 	struct arglist *argl; /* (4) */
 	ffi_type **atypes;
@@ -313,12 +225,12 @@ arg_error:
 				goto arg_error;
 			atypes = alloca(sizeof (ffi_type *) * nargs);
 			memcpy(atypes, argl->atypes, sizeof (ffi_type *) * nfixed);
-			nraw = populate_atypes(L, atypes, nfixed, nargs);
+			populate_atypes(L, atypes, nfixed, nargs);
 		}
 	} else { /* no argument info is given */
 		nfixed = nargs;
 		atypes = alloca(sizeof (ffi_type *) * nargs);
-		nraw = populate_atypes(L, atypes, 0, nargs);
+		populate_atypes(L, atypes, 0, nargs);
 	}
 
 	if (nfixed == nargs)
@@ -328,20 +240,37 @@ arg_error:
 
 	check_status(L, status);
 
-	fprintf(stderr, "FFI: nraw = %u, nargs = %u\n", (unsigned) nraw, (unsigned) nargs);
-	assert(nraw >= nargs);
-	parg = args = alloca(nraw * sizeof (ffi_raw));
+	args = alloca(sizeof (void *) * nargs);
 	for (i = 0; i < nargs; i++) {
-		parg = pusharg(L, i+1, parg, atypes[i]);
+		ffi_type *ftype;
+		int type, ltype;
+		int rc;
+
+		ftype = atypes[i];
+		type = ftype->type;
+		ltype = lua_type(L, i+1);
+		if (type == FFI_TYPE_POINTER) {
+			args[i] = alloca(sizeof (void *));
+			rc = cast_lua_pointer(L, i+1, (void **) args[i], ftype);
+		} else if (TYPE_IS_INT(type) || TYPE_IS_FLOAT(type)) {
+			args[i] = alloca(sizeof (ftype->size));
+			rc = cast_lua_number(L, i+1, args[i], type);
+		} else {
+			rc = 0;
+		}
+		if (!rc) {
+			return luaL_error(L, "cannot convert %s to %s",
+				lua_typename(L, ltype), type_names[type]);
+		}
 	}
 
 	/* FIXME large return values? */
 	if (rtype->size <= sizeof rvalue) {
-		ffi_raw_call(&cif, FFI_FN(fn), &rvalue, args);
+		ffi_call(&cif, FFI_FN(fn), &rvalue, args);
 		return cast_c_lua(L, &rvalue, rtype->type);
 	} else {
 		struct cvar *var = makecvar_(L, rtype, 0);
-		ffi_raw_call(&cif, FFI_FN(fn), var, args);
+		ffi_call(&cif, FFI_FN(fn), var, args);
 	}
 	return 1;
 }
@@ -453,7 +382,7 @@ int makecvar(lua_State *L)
 	arraysize = lua_tointeger(L, lua_upvalueindex(2));
 	var = makecvar_(L, type, arraysize);
 	if (!arraysize && lua_gettop(L) >= 1) {
-		cast_lua_c(L, 1, var->mem, type->type);
+		cast_lua_number(L, 1, var->mem, type->type);
 	} else {
 		memset(var->mem, 0, type->size * arraysize);
 	}
@@ -498,7 +427,7 @@ int c_newindex(lua_State *L)
 	int type;
 
 	addr = index2addr(L, &type);
-	if (!cast_lua_c(L, 3, addr, type))
+	if (!cast_lua_number(L, 3, addr, type))
 		return luaL_error(L, "cannot convert %s to %s",
 			lua_typename(L, lua_type(L, 3)),
 			type_names[type]);
