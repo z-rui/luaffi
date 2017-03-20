@@ -587,20 +587,13 @@ void cl_proxy(ffi_cif *cif, void *ret, void *args[], void *ud)
 
 	if (!lua_checkstack(L, nargs + 1))
 		luaL_error(L, "C stack overflow");
-	int top = lua_gettop(L);
-	fprintf(stderr, "FFI: before push, top = %d\n", top);
 	lua_rawgeti(L, LUA_REGISTRYINDEX, cl->ref);
 	luaL_checktype(L, -1, LUA_TFUNCTION);
 	/* push arguments */
 	for (i = 0; i < nargs; i++) {
 		cast_c_lua(L, args[i], cif->arg_types[i]->type);
 	}
-	top = lua_gettop(L);
-	fprintf(stderr, "FFI: before call, top = %d\n", top);
 	lua_call(L, nargs, 1);
-	top = lua_gettop(L);
-	fprintf(stderr, "FFI: after call, top = %d\n", top);
-	fprintf(stderr, "FFI: return type = %s\n", lua_typename(L, lua_type(L, top)));
 	rtype = cif->rtype->type;
 	/* XXX is it allowed to raise? */
 	cast_lua_c(L, -1, ret, rtype);
@@ -631,20 +624,6 @@ int cl_gc(lua_State *L)
 	cl->ref = LUA_NOREF;
 	return 0;
 }
-
-#if 1
-static
-int cl_call(lua_State *L)
-{
-	struct closure *cl;
-	int n;
-
-	cl = luaL_checkudata(L, 1, "ffi_closure");
-	n = ((int (*)(int, int)) cl->addr)(1, 2);
-	printf("1 + 2 = %d\n", n);
-	return 0;
-}
-#endif
 
 static
 int makeclosure(lua_State *L)
@@ -807,10 +786,6 @@ int luaopen_ffi(lua_State *L)
 	lua_setfield(L, -2, "__tostring");
 	lua_pushcfunction(L, cl_gc);
 	lua_setfield(L, -2, "__gc");
-#if 1
-	lua_pushcfunction(L, cl_call);
-	lua_setfield(L, -2, "__call");
-#endif
 
 	luaL_newlib(L, ffilib);
 	lua_pushvalue(L, loadfunc);
