@@ -257,7 +257,7 @@ arg_error:
 			rc = cast_lua_pointer(L, i+2, (void **) args[i]);
 		} else if (TYPE_IS_INT(type) || TYPE_IS_FLOAT(type)) {
 			args[i] = alloca(sizeof (ftype->size));
-			rc = cast_lua_number(L, i+2, args[i], type);
+			rc = cast_lua_c(L, i+2, args[i], type);
 		}
 		if (!rc) {
 			return luaL_error(L, "cannot convert %s to %s",
@@ -384,7 +384,7 @@ int makecvar(lua_State *L)
 	arraysize = lua_tointeger(L, lua_upvalueindex(2));
 	var = makecvar_(L, type, arraysize);
 	if (!arraysize && lua_gettop(L) >= 1) {
-		cast_lua_number(L, 1, var->mem, type->type);
+		cast_lua_c(L, 1, var->mem, type->type);
 	} else {
 		memset(var->mem, 0, type->size * arraysize);
 	}
@@ -429,7 +429,7 @@ int c_newindex(lua_State *L)
 	int type;
 
 	addr = index2addr(L, &type);
-	if (!cast_lua_number(L, 3, addr, type))
+	if (!cast_lua_c(L, 3, addr, type))
 		return luaL_error(L, "cannot convert %s to %s",
 			lua_typename(L, lua_type(L, 3)),
 			type_names[type]);
@@ -577,31 +577,45 @@ void define_type(lua_State *L, const char *name, ffi_type *type)
 	lua_setfield(L, table, name);
 }
 
+struct type_reg {
+	char *name;
+	ffi_type *type;
+};
+static
+struct type_reg predefined_types[] = {
+	{"uint", &ffi_type_uint},
+	{"int", &ffi_type_sint},
+	{"short", &ffi_type_sshort},
+	{"ushort", &ffi_type_ushort},
+	{"long", &ffi_type_slong},
+	{"ulong", &ffi_type_ulong},
+#if CHAR_MAX == SCHAR_MAX
+	{"char", &ffi_type_schar},
+	{"uchar", &ffi_type_uchar},
+#else
+	{"char", &ffi_type_uchar},
+	{"schar", &ffi_type_schar},
+#endif
+	/* assume long long is 64 bit */
+	{"longlong", &ffi_type_sint64},
+	{"ulonglong", &ffi_type_uint64},
+
+	{"float", &ffi_type_float},
+	{"double", &ffi_type_double},
+	{"longdouble", &ffi_type_longdouble},
+
+	{"pointer", &ffi_type_pointer},
+	{0, 0}
+};
+
 static
 void define_types(lua_State *L)
 {
-	define_type(L, "uint", &ffi_type_uint);
-	define_type(L, "int", &ffi_type_sint);
-	define_type(L, "short", &ffi_type_sshort);
-	define_type(L, "ushort", &ffi_type_ushort);
-	define_type(L, "long", &ffi_type_slong);
-	define_type(L, "ulong", &ffi_type_ulong);
-#if CHAR_MAX == SCHAR_MAX
-	define_type(L, "char", &ffi_type_schar);
-	define_type(L, "uchar", &ffi_type_uchar);
-#else
-	define_type(L, "char", &ffi_type_uchar);
-	define_type(L, "schar", &ffi_type_schar);
-#endif
+	struct type_reg *p;
 
-	/* assume long long is 64 bit */
-	define_type(L, "longlong", &ffi_type_sint64);
-	define_type(L, "ulonglong", &ffi_type_uint64);
-
-	define_type(L, "float", &ffi_type_float);
-	define_type(L, "double", &ffi_type_double);
-	define_type(L, "longdouble", &ffi_type_longdouble);
-	define_type(L, "pointer", &ffi_type_pointer);
+	for (p = predefined_types; p->name; p++) {
+		define_type(L, p->name, p->type);
+	}
 }
 
 LUAMOD_API

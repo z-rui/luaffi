@@ -92,7 +92,7 @@ int cast_number_c(lua_Number n, void *addr, int type)
 }
 
 static
-int cast_lua_number(lua_State *L, int i, void *addr, int type)
+int cast_lua_c(lua_State *L, int i, void *addr, int type)
 {
 	struct cvar *var;
 	int ltype;
