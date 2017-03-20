@@ -376,7 +376,7 @@ void *index2addr(lua_State *L, int *type)
 		luaL_error(L, "index out of range");
 	}
 	*type = var->type->type;
-	return var->mem + i * var->type->size;
+	return (char *) var->mem + i * var->type->size;
 }
 
 static
