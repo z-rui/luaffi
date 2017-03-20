@@ -129,7 +129,7 @@ ffi_type *type_info(lua_State *L, int i, size_t *arraysize)
 
 	if (!lua_getupvalue(L, i, 2))
 		return 0;
-	*arraysize = (size_t) lua_tonumberx(L, -1, &rc);
+	*arraysize = (size_t) lua_tointegerx(L, -1, &rc);
 	lua_pop(L, 1); /* pop arraysize */
 	if (!rc) return 0;
 	if (lua_getupvalue(L, i, 1)) {
