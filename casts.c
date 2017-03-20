@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 static
-int cast_lua_pointer(lua_State *L, int i, void **pp, ffi_type *ftype)
+int cast_lua_pointer(lua_State *L, int i, void **pp)
 {
 	int ltype;
 	lua_CFunction fn;
@@ -35,9 +35,8 @@ int cast_lua_pointer(lua_State *L, int i, void **pp, ffi_type *ftype)
 			var = luaL_testudata(L, i, "ffi_cvar");
 			if (var->arraysize > 0) {
 				*pp = (void *) var->mem;
-			} else if (ftype == var->type) {
-				/* XXX: C -> C cast is not supported */
-				*pp = (void *) var->mem;
+			} else if (var->type->type == FFI_TYPE_POINTER) {
+				*pp = *(void **) var->mem;
 			} else {
 				return 0;
 			}
@@ -95,11 +94,25 @@ int cast_number_c(lua_Number n, void *addr, int type)
 static
 int cast_lua_number(lua_State *L, int i, void *addr, int type)
 {
-	if (lua_isboolean(L, i))
-		return cast_int_c(lua_toboolean(L, i), addr, type);
-	return lua_isinteger(L, i)
-		? cast_int_c(lua_tointeger(L, i), addr, type)
-		: cast_number_c(lua_tonumber(L, i), addr, type);
+	struct cvar *var;
+	int ltype;
+
+	ltype = lua_type(L, i);
+	switch (ltype) {
+		case LUA_TBOOLEAN:
+			return cast_int_c(lua_toboolean(L, i), addr, type);
+		case LUA_TNUMBER:
+			return (lua_isinteger(L, i))
+				? cast_int_c(lua_tointeger(L, i), addr, type)
+				: cast_number_c(lua_tonumber(L, i), addr, type);
+		case LUA_TUSERDATA:
+			var = luaL_checkudata(L, i, "ffi_cvar");
+			if (!var || type != var->type->type)
+				return 0;
+			memcpy(addr, var->mem, var->type->size);
+			return 1;
+	}
+	return 0;
 }
 
 static

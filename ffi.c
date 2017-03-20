@@ -247,19 +247,17 @@ arg_error:
 	for (i = 0; i < nargs; i++) {
 		ffi_type *ftype;
 		int type, ltype;
-		int rc;
+		int rc = 0;
 
 		ftype = atypes[i];
 		type = ftype->type;
 		ltype = lua_type(L, i+2); /* i+2 is the position of the argument on lua stack */
 		if (type == FFI_TYPE_POINTER) {
 			args[i] = alloca(sizeof (void *));
-			rc = cast_lua_pointer(L, i+2, (void **) args[i], ftype);
+			rc = cast_lua_pointer(L, i+2, (void **) args[i]);
 		} else if (TYPE_IS_INT(type) || TYPE_IS_FLOAT(type)) {
 			args[i] = alloca(sizeof (ftype->size));
 			rc = cast_lua_number(L, i+2, args[i], type);
-		} else {
-			rc = 0;
 		}
 		if (!rc) {
 			return luaL_error(L, "cannot convert %s to %s",
@@ -273,7 +271,7 @@ arg_error:
 		return cast_c_lua(L, &rvalue, func->rtype->type);
 	} else {
 		struct cvar *var = makecvar_(L, func->rtype, 0);
-		ffi_call(&cif, FFI_FN(func->fn), var, args);
+		ffi_call(&cif, FFI_FN(func->fn), var->mem, args);
 	}
 	return 1;
 }
