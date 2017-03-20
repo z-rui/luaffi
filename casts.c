@@ -8,7 +8,6 @@ int cast_lua_pointer(lua_State *L, int i, void **pp)
 	int ltype;
 	lua_CFunction fn;
 	const char *name;
-	struct cvar *var;
 	struct cfunc *func;
 	struct closure *cl;
 
@@ -35,15 +34,17 @@ int cast_lua_pointer(lua_State *L, int i, void **pp)
 			*pp = lua_touserdata(L, i);
 			break;
 		case LUA_TUSERDATA:
+			/* TODO change to a __ffi_ptr metamethod call? */
 			if (luaL_getmetafield(L, i, "__name") != LUA_TSTRING)
 				goto fail;
 			name = lua_tostring(L, -1);
 			if (strcmp(name, "ffi_cvar") == 0) {
-				var = lua_touserdata(L, i);
-				if (var->arraysize > 0) {
-					*pp = (void *) var->mem;
-				} else if (var->type->type == FFI_TYPE_POINTER) {
-					*pp = *(void **) var->mem;
+				struct ctype *typ = c_typeof_(L, i, 1);
+				void *var = lua_touserdata(L, i);
+				if (typ->arraysize > 0) {
+					*pp = var;
+				} else if (typ->type->type == FFI_TYPE_POINTER) {
+					*pp = *(void **) var;
 				} else {
 					goto fail;
 				}
@@ -112,7 +113,6 @@ int cast_number_c(lua_Number n, void *addr, int type)
 static
 int cast_lua_c(lua_State *L, int i, void *addr, int type)
 {
-	struct cvar *var;
 	int ltype;
 	int rc = 0;
 
@@ -127,16 +127,20 @@ int cast_lua_c(lua_State *L, int i, void *addr, int type)
 			? cast_int_c(lua_tointeger(L, i), addr, type)
 			: cast_number_c(lua_tonumber(L, i), addr, type);
 	} else if (ltype == LUA_TUSERDATA) {
-		var = luaL_checkudata(L, i, "ffi_cvar");
-		if (var && type == var->type->type) {
-			memcpy(addr, var->mem, var->type->size * var->arraysize);
+		void *var = luaL_checkudata(L, i, "ffi_cvar");
+		struct ctype *typ = c_typeof_(L, i, 1);
+		if (type == typ->type->type) {
+			size_t size = typ->type->size;
+			if (typ->arraysize > 0)
+				size *= typ->arraysize;
+			memcpy(addr, var, size);
 			rc = 1;
 		}
 	}
 	if (rc == 0) {
 		lua_pushfstring(L, "expect %s, got %s",
-			lua_typename(L, ltype),
-			type_names[type]);
+			type_names[type],
+			lua_typename(L, ltype));
 		luaL_argerror(L, i, lua_tostring(L, -1));
 	}
 	return rc;
