@@ -163,14 +163,12 @@ void populate_atypes(lua_State *L, ffi_type **atypes, int begin, int end)
 				break;
 			case LUA_TUSERDATA:
 				var = luaL_testudata(L, i+2, "ffi_cvar");
-				if (var) {
-					if (var->arraysize > 0) {
-						atypes[i] = &ffi_type_pointer;
-					} else {
-						atypes[i] = var->type;
-					}
-					break;
+				if (var && var->arraysize == 0) {
+					atypes[i] = var->type;
+				} else {
+					atypes[i] = &ffi_type_pointer;
 				}
+				break;
 				/* fallthrough */
 			/* cannot be passed to C function */
 			case LUA_TTABLE:
@@ -470,6 +468,16 @@ int c_tostr(lua_State *L)
 	return 1;
 }
 
+static
+int f_tostr(lua_State *L)
+{
+	struct cfunc *func;
+
+	func = luaL_checkudata(L, 1, "ffi_cfunc");
+	lua_pushfstring(L, "C function: %p", func->fn);
+	return 1;
+}
+
 #if 0
 static
 int c_ptrstr(lua_State *L)
@@ -645,6 +653,8 @@ int luaopen_ffi(lua_State *L)
 	lua_setfield(L, -2, "__newindex");
 
 	luaL_newmetatable(L, "ffi_cfunc");
+	lua_pushcfunction(L, f_tostr);
+	lua_setfield(L, -2, "__tostring");
 	lua_pushcfunction(L, funccall);
 	lua_setfield(L, -2, "__call");
 

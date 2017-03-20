@@ -7,7 +7,9 @@ int cast_lua_pointer(lua_State *L, int i, void **pp)
 {
 	int ltype;
 	lua_CFunction fn;
+	const char *name;
 	struct cvar *var;
+	struct cfunc *func;
 
 	ltype = lua_type(L, i);
 	switch (ltype) {
@@ -32,16 +34,28 @@ int cast_lua_pointer(lua_State *L, int i, void **pp)
 			*pp = lua_touserdata(L, i);
 			break;
 		case LUA_TUSERDATA:
-			var = luaL_testudata(L, i, "ffi_cvar");
-			if (var->arraysize > 0) {
-				*pp = (void *) var->mem;
-			} else if (var->type->type == FFI_TYPE_POINTER) {
-				*pp = *(void **) var->mem;
+			if (luaL_getmetafield(L, i, "__name") != LUA_TSTRING)
+				goto fail;
+			name = lua_tostring(L, -1);
+			if (strcmp(name, "ffi_cvar") == 0) {
+				var = lua_touserdata(L, i);
+				if (var->arraysize > 0) {
+					*pp = (void *) var->mem;
+				} else if (var->type->type == FFI_TYPE_POINTER) {
+					*pp = *(void **) var->mem;
+				} else {
+					goto fail;
+				}
+			} else if (strcmp(name, "ffi_cfunc") == 0) {
+				func = lua_touserdata(L, i);
+				*pp = (void *) func->fn;
 			} else {
-				return 0;
+				goto fail;
 			}
+			lua_pop(L, 1); /* __name */
 			break;
 		default:
+fail:
 			return 0;
 	}
 	return 1;
