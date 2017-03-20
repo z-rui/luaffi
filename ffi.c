@@ -68,9 +68,6 @@ int openlib(lua_State *L)
 }
 
 static
-int funccall(lua_State *L);
-
-static
 int libindex(lua_State *L)
 {
 	lua_CFunction fn;
@@ -215,7 +212,7 @@ void check_status(lua_State *L, int status)
 
 static struct cvar *makecvar_(lua_State *, ffi_type *, size_t);
 
-int funccall(lua_State *L)
+int f_call(lua_State *L)
 {
 	struct cfunc *func;
 	ffi_cif cif;
@@ -278,29 +275,7 @@ arg_error:
 }
 
 static
-int c_sizeof(lua_State *L)
-{
-	ffi_type *type;
-	size_t size, arraysize;
-	struct cvar *var;
-
-	if ((var = luaL_testudata(L, 1, "ffi_cvar")) != 0) {
-		type = var->type;
-		arraysize = var->arraysize;
-	} else {
-		type = type_info(L, 1, &arraysize);
-	}
-
-	size = type->size;
-	if (arraysize > 0)
-		size *= arraysize;
-
-	lua_pushinteger(L, size);
-	return 1;
-}
-
-static
-int restype(lua_State *L)
+int f_restype(lua_State *L)
 {
 	struct cfunc *func;
 	ffi_type *type;
@@ -316,7 +291,7 @@ int restype(lua_State *L)
 }
 
 static
-int argtype(lua_State *L)
+int f_argtypes(lua_State *L)
 {
 	struct cfunc *func;
 	int nargs;
@@ -423,6 +398,28 @@ int c_newindex(lua_State *L)
 
 	addr = index2addr(L, &type);
 	cast_lua_c(L, 3, addr, type);
+	return 1;
+}
+
+static
+int c_sizeof(lua_State *L)
+{
+	ffi_type *type;
+	size_t size, arraysize;
+	struct cvar *var;
+
+	if ((var = luaL_testudata(L, 1, "ffi_cvar")) != 0) {
+		type = var->type;
+		arraysize = var->arraysize;
+	} else {
+		type = type_info(L, 1, &arraysize);
+	}
+
+	size = type->size;
+	if (arraysize > 0)
+		size *= arraysize;
+
+	lua_pushinteger(L, size);
 	return 1;
 }
 
@@ -640,14 +637,14 @@ int makeclosure(lua_State *L)
 static
 luaL_Reg ffilib[] = {
 	{"addr", c_addr},
-	{"argtype", argtype},
+	{"argtypes", f_argtypes},
 	{"array", array},
 #if 0
 	{"ptrstr", c_ptrstr},
 #endif
 	{"deref", c_ptrderef},
 	{"closure", makeclosure},
-	{"restype", restype},
+	{"restype", f_restype},
 	{"sizeof", c_sizeof},
 	{"tonumber", c_tonum},
 	{"openlib", 0}, /* placeholder */
@@ -745,7 +742,7 @@ int luaopen_ffi(lua_State *L)
 	luaL_newmetatable(L, "ffi_cfunc");
 	lua_pushcfunction(L, f_tostr);
 	lua_setfield(L, -2, "__tostring");
-	lua_pushcfunction(L, funccall);
+	lua_pushcfunction(L, f_call);
 	lua_setfield(L, -2, "__call");
 
 	luaL_newmetatable(L, "ffi_closure");
