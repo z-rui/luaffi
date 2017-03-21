@@ -34,6 +34,8 @@ struct ctype {
 	size_t arraysize; /* 0 for non-array */
 };
 
+static struct ctype voidtype = { &ffi_type_void, 0 };
+
 static size_t c_sizeof_(struct ctype *typ)
 {
 	size_t size;
@@ -52,22 +54,20 @@ struct cstruct_ {
 	ffi_type *elements[1]; /* 1 for the trailing NULL */
 };
 
-static struct ctype voidtype = { &ffi_type_void, 0 };
-
 /* cif is stored as the uservalue of a function / closure
  * object.
  *
  * `cif' of a function may not be prepared when a function
  * is called; or it may be prepared for a different number
  * of arguments in the last call.  Thus `cif.nargs' cannot
- * be used to determine the number of arguments.  `nparams'
+ * be used to determine the number of parameters.  `nparams'
  * field in cfunc struct is provided for this purpose.
  *
  * `cif' of a closure is already prepared.  When a closure
  * is called, this struct does not change.
  *
- * The uservalue of a cif object is a Lua table storing all
- * types it references to.
+ * The uservalue of a cif object is a Lua table referencing
+ * types of return value and parameters.
  */
 struct cif {
 	ffi_cif cif;
@@ -76,7 +76,7 @@ struct cif {
 };
 
 /* Note: supporting variadic function calls (by calling
- * ffi_prep_cif) turned out to be not very helpful;
+ * ffi_prep_cif_var) turned out to be not very helpful;
  * this feature is removed for now.
  * Rather, passing more arguments than specified in cif
  * is permitted, as a workaround.  Users are responsible
