@@ -8,6 +8,32 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Here's how I deal with types:
+ *
+ * A type is stored in a ctype struct.
+ * It is set to be the uservalue of any cvar object,
+ * so that it will not be garbage-collected when
+ * instances of this type remains alive.
+ *
+ * `type' field in the struct either points
+ * to a predefined static variable from libFFI,
+ * or to a userdata that is allocated by Lua.
+ * If `type' points to a userdata, then it is set
+ * to be the uservalue of this object, to deal with
+ * garbage collection.
+ *
+ * Remember: no memory is owned by this struct
+ * and thus requires a finalizer. Any memory it referenced
+ * to is either static or managed automatically
+ * by Lua.
+ *
+ * If it is a compound type (TODO: not implemented yet),
+ * then `type' must be a userdata (this statement is to be
+ * reconsidered when I start implementing compound types),
+ * and that userdata will hold a uservalue of a Lua table,
+ * referencing all relevant types.
+ */
+
 struct ctype {
 	ffi_type *type;
 	size_t arraysize;
@@ -15,33 +41,45 @@ struct ctype {
 
 static struct ctype voidtype = { &ffi_type_void, 0 };
 
-/* The uservalue of a cfunc object can be:
- * 1) nil.  No information of return value and parameters
- *    was given.
- * 2) a ctype object.  It is the type of the return value.
- * 3) a Lua table t, where:
- *   - t[1] is the type of the return value;
- *   - t[2] is the type of the first argument;
- *   - t[n] is the type of the (n-1)-th argument.
+/* cif is stored as the uservalue of a function / closure
+ * object.
+ *
+ * `cif' of a function may not be prepared when a function
+ * is called; or it may be prepared for a different number
+ * of arguments in the last call.  Thus `cif.nargs' cannot
+ * be used to determine the number of arguments.  `nparams'
+ * field in cfunc struct is provided for this purpose.
+ *
+ * `cif' of a closure is already prepared.  When a closure
+ * is called, this struct does not change.
+ *
+ * The uservalue of a cif object is a Lua table storing all
+ * types it references to.
  */
-/* XXX: supporting variadic function calls turned out
- * to be not very helpful, due to casting difficulties.
- * This feature is removed for now;
- * rather, passing more arguments than specified is
- * supported, as a workaround.  Users are responsible
+struct cif {
+	ffi_cif cif;
+	ffi_type *types[1]; /* types[0] is rtype */
+	/* additional space types[1] etc are arg_types */
+};
+
+/* Note: supporting variadic function calls (by calling
+ * ffi_prep_cif) turned out to be not very helpful;
+ * this feature is removed for now.
+ * Rather, passing more arguments than specified in cif
+ * is permitted, as a workaround.  Users are responsible
  * to get the casting right. */
 struct cfunc {
 	lua_CFunction fn;
-	ffi_cif cif;
-	/* we can borrow the abi, nargs field from cif. */
+	unsigned nparams;
+	int cache_valid;
+	/* we can borrow the abi field from cif. */
 };
 
 struct closure {
 	lua_State *L;
 	ffi_closure *cl;
-	ffi_cif cif;
 	void *addr;
-	int ref; /* ref of lua cl */
+	int ref; /* ref of lua closure */
 };
 
 static
@@ -85,6 +123,7 @@ int libindex(lua_State *L)
 {
 	lua_CFunction fn;
 	struct cfunc *func;
+	struct cif *cif;
 
 	lua_pushvalue(L, lua_upvalueindex(1)); /* loadlib() */
 	lua_pushliteral(L, "__FFI_LIBNAME");
@@ -108,10 +147,17 @@ int libindex(lua_State *L)
 
 	func = lua_newuserdata(L, sizeof (struct cfunc));
 	func->fn = fn;
-	func->cif.nargs = 0;
-	func->cif.abi = FFI_DEFAULT_ABI;
+	func->nparams = 0;
+	func->cache_valid = 0;
+	/* make a default cif */
+	cif = lua_newuserdata(L, sizeof (struct cif));
+	lua_pushliteral(L, "__FFI_ABI");
+	lua_rawget(L, 1);
+	cif->cif.abi = lua_tonumber(L, -1);
+	lua_pop(L, 1); /* ABI */
+	cif->types[0] = &ffi_type_sint; /* default return int */
+	lua_setuservalue(L, -2); /* func.uservalue = cif */
 	luaL_setmetatable(L, "ffi_cfunc");
-	/* the uservalue is nil */
 
 	/* cache the function in library table */
 	lua_pushvalue(L, 2); /* name */
@@ -219,37 +265,53 @@ void check_status(lua_State *L, int status)
 }
 
 static struct cvar *makecvar_(lua_State *);
-static unsigned f_getproto_(lua_State *L, ffi_type **rtype, ffi_type **arg_types, unsigned nargs);
 
 /* TODO: can cache CIF */
 int f_call(lua_State *L)
 {
 	struct cfunc *func;
+	struct cif *cif;
 	void **args;
-	ffi_type *rtype = 0;
-	ffi_type **atypes = 0;
+	ffi_type *rtype;
+	ffi_type **atypes;
 	ffi_arg rvalue;
 	ffi_status status;
 	ffi_abi ABI;
 	unsigned int i;
-	unsigned nargs, nfixed;
+	unsigned nargs, nparams;
 
 	nargs = lua_gettop(L) - 1; /* exclude 'self' */
 	func = luaL_checkudata(L, 1, "ffi_cfunc");
-	ABI = func->cif.abi;
-	atypes = alloca(sizeof (ffi_type *) * nargs);
-	nfixed = f_getproto_(L, &rtype, atypes, nargs);
+	lua_getuservalue(L, 1);
+	cif = lua_touserdata(L, -1);
+	ABI = cif->cif.abi;
+	nparams = func->nparams; /* don't use cif.nargs; it might have been modified by a previous call */
+	rtype = cif->types[0];
+	atypes = nparams ? &cif->types[1] : 0;
 
-	if (nargs < nfixed) {
+	if (nargs < nparams) {
 		return luaL_error(L, "expect %d arguments, %d given",
-			nfixed, nargs);
-	} else if (nargs > 0) {
-		/* default types for additional arguments */
-		populate_atypes(L, atypes, nfixed, nargs);
+			nparams, nargs);
 	}
 
-	status = ffi_prep_cif(&func->cif, ABI, nargs, rtype, atypes);
-	check_status(L, status);
+	if (nargs > nparams) {
+		/* must allocate temporary atypes[] */
+		atypes = alloca(sizeof (ffi_type *) * nargs);
+		memcpy(atypes, &cif->types[1], sizeof (ffi_type *) * nparams);
+		/* set default types for additional arguments */
+		populate_atypes(L, atypes, nparams, nargs);
+	}
+
+	if (nargs != nparams)
+		func->cache_valid = 0;
+
+	/* cache for non-variadic functions */
+	if (!func->cache_valid) {
+		status = ffi_prep_cif(&cif->cif, ABI, nargs, rtype, atypes);
+		check_status(L, status);
+		if (nargs == nparams)
+			func->cache_valid = 1;
+	}
 
 	args = alloca(sizeof (void *) * nargs);
 	for (i = 0; i < nargs; i++) {
@@ -260,20 +322,27 @@ int f_call(lua_State *L)
 	}
 
 	if (rtype->size <= sizeof rvalue) {
-		ffi_call(&func->cif, FFI_FN(func->fn), &rvalue, args);
+		ffi_call(&cif->cif, FFI_FN(func->fn), &rvalue, args);
 		return cast_c_lua(L, &rvalue, rtype->type);
 	} else {
-		/* return typ is on stack top */
+		/* cif is on stack top */
+		if (lua_getuservalue(L, -1) == LUA_TTABLE) {
+			lua_rawgeti(L, -1, 1);
+			lua_replace(L, -2);
+		}
+		/* rtype is on stack top */
 		void *var = makecvar_(L);
-		ffi_call(&func->cif, FFI_FN(func->fn), var, args);
+		ffi_call(&cif->cif, FFI_FN(func->fn), var, args);
 	}
 	return 1;
 }
 
-/* |func, rtype, [atypes ...] -> func, proto */
+/* |func, rtype, [atype, ...] -> |func cif */
 static
-void f_packproto_(lua_State *L)
+struct cif *make_cif_(lua_State *L, ffi_abi ABI)
 {
+	struct cif *cif;
+	struct ctype *typ;
 	int nargs, i;
 
 	nargs = lua_gettop(L) - 2;
@@ -283,67 +352,56 @@ void f_packproto_(lua_State *L)
 	} else {
 		type_info(L, 2, 0); /* ensure not an array */
 	}
-	if (nargs > 0) {
+	cif = lua_newuserdata(L, sizeof (struct cif) + sizeof (ffi_type) * (nargs));
+
+	lua_pushvalue(L, 2);
+	typ = lua_touserdata(L, -1);
+	cif->cif.nargs = nargs;
+	cif->cif.abi = ABI;
+	cif->types[0] = typ->type;
+	/* stack: |func rtype [atype, ...] cif rtype */
+	if (nargs == 0) {
+		/* only reference the return type */
+		lua_setuservalue(L, -2); /* rtype popped */
+	} else {
+		/* must use a table to hold all types */
 		lua_createtable(L, nargs + 1, 0);
-		lua_pushvalue(L, 2); /* return type */
+		lua_insert(L, -2);
+		/* return type is on stack top */
 		lua_rawseti(L, -2, 1);
 		for (i = 0; i < nargs; i++) {
 			lua_pushvalue(L, i+3);
-			type_info(L, i+3, 0);    /* ensure not an array */
+			/* ensure not an array */
+			cif->types[i+1] = type_info(L, i+3, 0);
 			lua_rawseti(L, -2, i+2);
 		}
-		lua_replace(L, 2);
+		/* reference the table */
+		lua_setuservalue(L, -2); /* table popped */
 	}
+	/* cif is on stack top */
+	lua_replace(L, 2);
 	lua_settop(L, 2);
+	return cif;
 }
 
 static
-int f_types(lua_State *L)
+int f_setproto(lua_State *L)
 {
-	luaL_checkudata(L, 1, "ffi_cfunc");
-	f_packproto_(L);
-	lua_setuservalue(L, 1);
+	struct cfunc *func;
+	struct cif *cif;
+	ffi_abi ABI;
+
+	func = luaL_checkudata(L, 1, "ffi_cfunc");
+	lua_getuservalue(L, 1);
+	cif = lua_touserdata(L, -1);
+	ABI = cif->cif.abi;
+	lua_pop(L, 1); /* old cif */
+	cif = make_cif_(L, ABI);
+	lua_setuservalue(L, 1); /* func.uservalue = new cif */
+	func->nparams = cif->cif.nargs;
 	return 1;
 }
 
-/* |func ... -> |func ... rtype */
-static
-unsigned f_getproto_(lua_State *L, ffi_type **rtype, ffi_type **atypes, unsigned nargs)
-{
-	struct ctype *typ;
-	unsigned i, nparams = 0; 
-
-	switch (lua_getuservalue(L, 1)) {
-		case LUA_TNIL:
-			*rtype = &ffi_type_sint;
-			break;
-		case LUA_TLIGHTUSERDATA:
-		case LUA_TUSERDATA:
-			typ = lua_touserdata(L, -1);
-			*rtype = typ->type;
-			break;
-		case LUA_TTABLE:
-			nparams = (unsigned) (lua_rawlen(L, -1) - 1);
-			if (nparams < nargs)
-				nargs = nparams; /* nargs = min(nargs, nparams) */
-			for (i = 0; i < nargs; i++) {
-				lua_rawgeti(L, -1, i+2);
-				typ = lua_touserdata(L, -1);
-				lua_pop(L, 1); /* typ */
-				if (!typ) break;
-				atypes[i] = typ->type;
-			}
-			lua_rawgeti(L, -1, 1);
-			typ = lua_touserdata(L, -1);
-			*rtype = typ->type;
-			lua_remove(L, -2); /* remove table */
-			break;
-		default:
-			luaL_error(L, "FFI internal error: "
-				"invalid uservalue of a ffi_cfunc object");
-	}
-	return nparams;
-}
 
 static
 struct cvar *makecvar_(lua_State *L)
@@ -549,33 +607,6 @@ int c_tonum(lua_State *L)
 	return 1;
 }
 
-/* Here's how I deal with types:
- *
- * A type is stored in a ctype struct.
- * It is set to be the uservalue of any
- * cvar object, so that it will not
- * get collected with alive instances of
- * this type.
- *
- * The `type' member in the struct either points
- * to a predefined static variable from libFFI,
- * or to a userdata that is allocated by Lua.
- * If it is a userdata, then that userdata
- * is set to be the uservalue of this object,
- * so the memory will not get collected.
- *
- * Rule of thumb: no memory is owned by this struct
- * and thus requires a finalizer. Any memory it referenced
- * to is either static or managed automatically
- * by Lua.
- *
- * If it is a compound type (TODO: not implemented yet),
- * then `type' must be a userdata (to be reconsidered
- * when I start implement compound types), and
- * it userdata will hold an uservalue of a Lua table,
- * referencing all relevant types.
- */
-
 static
 struct ctype *makectype_(lua_State *L, ffi_type *type, size_t arraysize)
 {
@@ -677,9 +708,8 @@ static
 int makeclosure(lua_State *L)
 {
 	struct closure *cl;
+	struct cif *cif;
 	int nargs;
-	ffi_type **atypes = 0;
-	ffi_type *rtype;
 	ffi_status status;
 
 	luaL_checktype(L, 1, LUA_TFUNCTION);
@@ -696,31 +726,26 @@ int makeclosure(lua_State *L)
 	cl->ref = luaL_ref(L, LUA_REGISTRYINDEX);
 	lua_replace(L, 1);
 
-	f_packproto_(L); /* func, rtype, atypes... */
+	cif = make_cif_(L, FFI_DEFAULT_ABI);
+	lua_setuservalue(L, 1); /* closure.uservalue = cif */
 
-	if (nargs > 0) {
-		atypes = lua_newuserdata(L, sizeof (ffi_type *) * nargs);
-		lua_rawseti(L, -2, 0); /* just to keep a reference */
-	}
-	lua_setuservalue(L, 1);
-
-	f_getproto_(L, &rtype, atypes, nargs);
-	lua_pop(L, 1); /* rtype */
-
-	status = ffi_prep_cif(&cl->cif, FFI_DEFAULT_ABI, nargs, rtype, atypes);
+	status = ffi_prep_cif(&cif->cif, FFI_DEFAULT_ABI, nargs, cif->types[0], &cif->types[1]);
 	check_status(L, status);
+
 	cl->cl = ffi_closure_alloc(sizeof (ffi_closure), &cl->addr);
 	if (!cl->cl)
 		return luaL_error(L, "allocating closure failed");
-	status = ffi_prep_closure_loc(cl->cl, &cl->cif, cl_proxy, cl, cl->addr);
+
+	status = ffi_prep_closure_loc(cl->cl, &cif->cif, cl_proxy, cl, cl->addr);
 	check_status(L, status);
+
 	return 1;
 }
 
 static
 luaL_Reg ffilib[] = {
 	{"addr", c_addr},
-	{"types", f_types},
+	{"cif", f_setproto},
 	{"array", makearraytype},
 #if 0
 	{"ptrstr", c_ptrstr},
