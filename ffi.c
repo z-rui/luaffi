@@ -545,7 +545,9 @@ int c_index(lua_State *L)
 	int type;
 
 	addr = index2addr(L, &type);
-	if (!cast_c_lua(L, addr, type)) {
+	if (!addr) {
+		lua_pushnil(L);
+	} else if (!cast_c_lua(L, addr, type)) {
 		struct ctype *typ;
 		void *var;
 
