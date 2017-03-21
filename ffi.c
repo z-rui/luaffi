@@ -82,8 +82,9 @@ struct closure {
 	int ref; /* ref of lua closure */
 };
 
+/* loadlib, libname, funcname -> (func | true | nil err1 err2) */
 static
-int callloadlib(lua_State *L)
+int loadlib_(lua_State *L)
 {
 	int ret = lua_gettop(L) - 2;
 
@@ -99,15 +100,15 @@ int openlib(lua_State *L)
 	lua_pushvalue(L, lua_upvalueindex(1)); /* loadlib() */
 	lua_pushvalue(L, 1); /* libname */
 	lua_pushliteral(L, "*");
-	if (!callloadlib(L)) {
+	if (!loadlib_(L)) {
 		lua_pop(L, 1); /* pop "open" */
 		/* error message is on stack top */
-		lua_error(L);
+		return lua_error(L);
 	}
 	lua_pop(L, 1); /* pop true on success */
 
 	/* XXX: does not check the ABI;
-	 * but setting ABI is unportable anyway. */
+	 * but setting an ABI is unportable anyway. */
 	ABI = luaL_optinteger(L, 2, FFI_DEFAULT_ABI);
 	lua_createtable(L, 0, 2);
 	lua_pushvalue(L, 1);
@@ -115,15 +116,36 @@ int openlib(lua_State *L)
 	lua_pushinteger(L, ABI);
 	lua_setfield(L, -2, "__FFI_ABI");
 	luaL_setmetatable(L, "ffi_library");
+
+	/* TODO: cache the library? */
 	return 1;
 }
 
 static
-int libindex(lua_State *L)
+struct cfunc *makecfunc_(lua_State *L, lua_CFunction fn, ffi_abi ABI)
 {
-	lua_CFunction fn;
 	struct cfunc *func;
 	struct cif *cif;
+
+	func = lua_newuserdata(L, sizeof (struct cfunc));
+	func->fn = fn;
+	func->nparams = 0;
+	func->cache_valid = 0;
+	/* make a default cif */
+	cif = lua_newuserdata(L, sizeof (struct cif));
+	cif->cif.abi = ABI;
+	cif->types[0] = &ffi_type_sint; /* default return int */
+	lua_setuservalue(L, -2); /* func.uservalue = cif */
+	luaL_setmetatable(L, "ffi_cfunc");
+	
+	return func;
+}
+
+static
+int findfunc(lua_State *L)
+{
+	lua_CFunction fn;
+	ffi_abi ABI;
 
 	lua_pushvalue(L, lua_upvalueindex(1)); /* loadlib() */
 	lua_pushliteral(L, "__FFI_LIBNAME");
@@ -138,26 +160,17 @@ int libindex(lua_State *L)
 		lua_pop(L, 1);
 	}
 
-	callloadlib(L);
+	loadlib_(L);
 	fn = lua_tocfunction(L, -1); /* fun = loadlib(libname, funcname) */
 	if (!fn) {
 		lua_pushnil(L);
 		return 1;
 	}
 
-	func = lua_newuserdata(L, sizeof (struct cfunc));
-	func->fn = fn;
-	func->nparams = 0;
-	func->cache_valid = 0;
-	/* make a default cif */
-	cif = lua_newuserdata(L, sizeof (struct cif));
 	lua_pushliteral(L, "__FFI_ABI");
 	lua_rawget(L, 1);
-	cif->cif.abi = lua_tonumber(L, -1);
-	lua_pop(L, 1); /* ABI */
-	cif->types[0] = &ffi_type_sint; /* default return int */
-	lua_setuservalue(L, -2); /* func.uservalue = cif */
-	luaL_setmetatable(L, "ffi_cfunc");
+	ABI = lua_tonumber(L, -1);
+	makecfunc_(L, fn, ABI);
 
 	/* cache the function in library table */
 	lua_pushvalue(L, 2); /* name */
@@ -236,7 +249,6 @@ void populate_atypes(lua_State *L, ffi_type **atypes, int begin, int end)
 					}
 				}
 				break;
-				/* fallthrough */
 			/* cannot be passed to C function */
 			case LUA_TTABLE:
 			case LUA_TTHREAD:
@@ -264,7 +276,7 @@ void check_status(lua_State *L, int status)
 	}
 }
 
-static struct cvar *makecvar_(lua_State *);
+static struct cvar *makecvar_(lua_State *, int);
 
 /* TODO: can cache CIF */
 int f_call(lua_State *L)
@@ -331,7 +343,7 @@ int f_call(lua_State *L)
 			lua_replace(L, -2);
 		}
 		/* rtype is on stack top */
-		void *var = makecvar_(L);
+		void *var = makecvar_(L, -1);
 		ffi_call(&cif->cif, FFI_FN(func->fn), var, args);
 	}
 	return 1;
@@ -403,25 +415,25 @@ int f_setproto(lua_State *L)
 }
 
 
+/* ... -> ... var */
 static
-struct cvar *makecvar_(lua_State *L)
+struct cvar *makecvar_(lua_State *L, int i)
 {
 	size_t memsize;
 	struct cvar *var;
 	struct ctype *typ;
 
 	/* type object is at stack top */
-	typ = luaL_checkudata(L, -1, "ffi_ctype");
+	typ = luaL_checkudata(L, i, "ffi_ctype");
 
 	memsize = typ->type->size;
 	if (typ->arraysize > 0)
 		memsize *= typ->arraysize;
 	var = lua_newuserdata(L, memsize);
 	luaL_setmetatable(L, "ffi_cvar");
-	lua_insert(L, -2);
+	lua_pushvalue(L, i);
 	lua_setuservalue(L, -2); /* var.uservalue = type */
-	/* the type object is gone;
-	 * stack top is now `var'. */
+	/* stack top is `var'. */
 	return var;
 }
 
@@ -434,8 +446,7 @@ int makecvar(lua_State *L)
 
 	top = lua_gettop(L);
 	typ = luaL_checkudata(L, 1, "ffi_ctype");
-	lua_pushvalue(L, 1);
-	var = makecvar_(L);
+	var = makecvar_(L, 1);
 
 	if (top >= 2) {
 		cast_lua_c(L, 2, var, typ->type->type);
@@ -578,8 +589,7 @@ int c_ptrderef(lua_State *L)
 		elemsize = (size_t) luaL_checkinteger(L, 4);
 	ptr = (char *) ptr + offset * elemsize;
 	if (arraysize) {
-		lua_pushvalue(L, 2); /* type */
-		void *var = makecvar_(L);
+		void *var = makecvar_(L, 2);
 		memcpy(var, ptr, type->size * arraysize);
 		return 1;
 	}
@@ -743,13 +753,10 @@ int makeclosure(lua_State *L)
 }
 
 static
-luaL_Reg ffilib[] = {
+luaL_Reg ffi_reg[] = {
 	{"addr", c_addr},
 	{"cif", f_setproto},
 	{"array", makearraytype},
-#if 0
-	{"ptrstr", c_ptrstr},
-#endif
 	{"deref", c_ptrderef},
 	{"closure", makeclosure},
 	{"sizeof", c_sizeof},
@@ -809,17 +816,17 @@ void define_types(lua_State *L)
 LUAMOD_API
 int luaopen_ffi(lua_State *L)
 {
-	int loadfunc;
+	int loadlib;
 
 	luaL_requiref(L, "package", luaopen_package, 0);
 	lua_getfield(L, -1, "loadlib");
 	if (!lua_isfunction(L, -1))
 		return luaL_error(L, "cannot find package.loadlib");
-	loadfunc = lua_gettop(L); /* package.loadlib */
+	loadlib = lua_gettop(L); /* package.loadlib */
 
 	luaL_newmetatable(L, "ffi_library");
-	lua_pushvalue(L, loadfunc);
-	lua_pushcclosure(L, libindex, 1);
+	lua_pushvalue(L, loadlib);
+	lua_pushcclosure(L, findfunc, 1);
 	lua_setfield(L, -2, "__index");
 	lua_pushliteral(L, "v"); /* weak value table */
 	lua_setfield(L, -2, "__mode");
@@ -848,8 +855,8 @@ int luaopen_ffi(lua_State *L)
 	lua_pushcfunction(L, cl_gc);
 	lua_setfield(L, -2, "__gc");
 
-	luaL_newlib(L, ffilib);
-	lua_pushvalue(L, loadfunc);
+	luaL_newlib(L, ffi_reg);
+	lua_pushvalue(L, loadlib);
 	lua_pushcclosure(L, openlib, 1);
 	lua_setfield(L, -2, "openlib");
 	define_types(L);
