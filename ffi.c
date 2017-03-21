@@ -342,18 +342,28 @@ int f_call(lua_State *L)
 			func->cache_valid = 1; /* cache for non-variadic functions */
 	}
 
-	args = alloca(sizeof (void *) * nargs);
-	for (i = 0; i < nargs; i++) {
-		ffi_type *ftype = atypes[i];
+	if (nargs > 0) {
+		args = alloca(sizeof (void *) * nargs);
+		for (i = 0; i < nargs; i++) {
+			ffi_type *ftype = atypes[i];
 
-		args[i] = alloca(sizeof (ftype->size));
-		cast_lua_c(L, i+2, args[i], ftype->type);
+			args[i] = alloca(sizeof (ftype->size));
+			cast_lua_c(L, i+2, args[i], ftype->type);
+		}
+	} else {
+		args = 0;
 	}
 
-	if (rtype->size <= sizeof rvalue) {
+	if (rtype->type == FFI_TYPE_VOID) {
+		ffi_call(&cif->cif, FFI_FN(func->fn), 0, args);
+	} else if (rtype->size <= sizeof rvalue) {
 		ffi_call(&cif->cif, FFI_FN(func->fn), &rvalue, args);
-		return cast_c_lua(L, &rvalue, rtype->type);
+		if (!cast_c_lua(L, &rvalue, rtype->type)) {
+			lua_pop(L, 1); /* nil */
+			goto large_rvalue;
+		}
 	} else {
+large_rvalue:
 		/* cif is on stack top */
 		if (lua_getuservalue(L, -1) == LUA_TTABLE) {
 			lua_rawgeti(L, -1, 1);
@@ -471,15 +481,6 @@ int makecvar(lua_State *L)
 	return 1;
 }
 
-static void stackdump(lua_State *L)
-{
-	int i;
-	fprintf(stderr, "FFI: dump stack: ");
-	for (i = 1; i <= lua_gettop(L); i++) {
-		fprintf(stderr, "%s ", lua_typename(L, lua_type(L, i)));
-	}
-	fprintf(stderr, "\n");
-}
 /* this function does three things:
  * 1. return the base address of the variable;
  * 2. set *type to be the libFFI typecode;
