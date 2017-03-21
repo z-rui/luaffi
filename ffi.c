@@ -18,25 +18,38 @@
  * `type' field in the struct either points
  * to a predefined static variable from libFFI,
  * or to a userdata that is allocated by Lua.
- * If `type' points to a userdata, then it is set
- * to be the uservalue of this object, to deal with
- * garbage collection.
  *
  * Remember: no memory is owned by this struct
  * and thus requires a finalizer. Any memory it referenced
  * to is either static or managed automatically
  * by Lua.
  *
- * If it is a compound type (TODO: not implemented yet),
- * then `type' must be a userdata (this statement is to be
- * reconsidered when I start implementing compound types),
+ * If it is a compound type, then `type' must be a userdata,
  * and that userdata will hold a uservalue of a Lua table,
  * referencing all relevant types.
  */
 
 struct ctype {
 	ffi_type *type;
-	size_t arraysize;
+	size_t arraysize; /* 0 for non-array */
+};
+
+static size_t c_sizeof_(struct ctype *typ)
+{
+	size_t size;
+
+	size = typ->type->size;
+	if (typ->arraysize > 0)
+		size *= typ->arraysize;
+	return size;
+}
+
+/* specialized for structs */
+struct cstruct_ {
+	struct ctype ctype;
+	ffi_type ffi;
+	size_t nfields;
+	ffi_type *elements[1]; /* 1 for the trailing NULL */
 };
 
 static struct ctype voidtype = { &ffi_type_void, 0 };
@@ -236,9 +249,15 @@ void populate_atypes(lua_State *L, ffi_type **atypes, int begin, int end)
 			case LUA_TFUNCTION: /* as pointer */
 				atypes[i] = &ffi_type_pointer;
 				break;
-			case LUA_TBOOLEAN:
-			case LUA_TNUMBER: /* as int */
+			case LUA_TBOOLEAN: /* as int */
 				atypes[i] = &ffi_type_sint;
+				break;
+			case LUA_TNUMBER:
+				if (lua_isinteger(L, i+2)) {
+					atypes[i] = &ffi_type_sint;
+				} else {
+					atypes[i] = &ffi_type_double;
+				}
 				break;
 			case LUA_TUSERDATA:
 				atypes[i] = &ffi_type_pointer;
@@ -278,7 +297,6 @@ void check_status(lua_State *L, int status)
 
 static struct cvar *makecvar_(lua_State *, int);
 
-/* TODO: can cache CIF */
 int f_call(lua_State *L)
 {
 	struct cfunc *func;
@@ -317,12 +335,11 @@ int f_call(lua_State *L)
 	if (nargs != nparams)
 		func->cache_valid = 0;
 
-	/* cache for non-variadic functions */
 	if (!func->cache_valid) {
 		status = ffi_prep_cif(&cif->cif, ABI, nargs, rtype, atypes);
 		check_status(L, status);
 		if (nargs == nparams)
-			func->cache_valid = 1;
+			func->cache_valid = 1; /* cache for non-variadic functions */
 	}
 
 	args = alloca(sizeof (void *) * nargs);
@@ -342,6 +359,7 @@ int f_call(lua_State *L)
 			lua_rawgeti(L, -1, 1);
 			lua_replace(L, -2);
 		}
+		luaL_checkudata(L, -1, "ffi_ctype");
 		/* rtype is on stack top */
 		void *var = makecvar_(L, -1);
 		ffi_call(&cif->cif, FFI_FN(func->fn), var, args);
@@ -419,17 +437,14 @@ int f_setproto(lua_State *L)
 static
 struct cvar *makecvar_(lua_State *L, int i)
 {
-	size_t memsize;
 	struct cvar *var;
 	struct ctype *typ;
 
-	/* type object is at stack top */
+	/* type object is at position i */
+	i = lua_absindex(L, i);
 	typ = luaL_checkudata(L, i, "ffi_ctype");
 
-	memsize = typ->type->size;
-	if (typ->arraysize > 0)
-		memsize *= typ->arraysize;
-	var = lua_newuserdata(L, memsize);
+	var = lua_newuserdata(L, c_sizeof_(typ));
 	luaL_setmetatable(L, "ffi_cvar");
 	lua_pushvalue(L, i);
 	lua_setuservalue(L, -2); /* var.uservalue = type */
@@ -456,28 +471,70 @@ int makecvar(lua_State *L)
 	return 1;
 }
 
+static void stackdump(lua_State *L)
+{
+	int i;
+	fprintf(stderr, "FFI: dump stack: ");
+	for (i = 1; i <= lua_gettop(L); i++) {
+		fprintf(stderr, "%s ", lua_typename(L, lua_type(L, i)));
+	}
+	fprintf(stderr, "\n");
+}
+/* this function does three things:
+ * 1. return the base address of the variable;
+ * 2. set *type to be the libFFI typecode;
+ * 3. pushes the type of the result object on to the lua stack;
+ *
+ * if out of bound, return NULL.
+ */
 static
-void *index2addr(lua_State *L, int *type)
+void *index2addr(lua_State *L, int *ptype)
 {
 	void *var;
 	struct ctype *typ;
 	size_t i;
-	int rc;
+	int type;
 
 	var = luaL_checkudata(L, 1, "ffi_cvar");
-	typ = c_typeof_(L, 1, 1);
-	i = lua_tointegerx(L, 2, &rc);
-	if (!rc || typ->arraysize == 0) {
-		const char *tname = type_names[typ->type->type];
+	i = luaL_checkinteger(L, 2);
+	typ = c_typeof_(L, 1, 0);
+	type = typ->type->type;
+
+	if (typ->arraysize > 0) {
+		if (i >= typ->arraysize) return 0;
+		var = (char *) var + i * typ->type->size;
+	} else if (type == FFI_TYPE_STRUCT) {
+		struct cstruct_ *styp = (struct cstruct_ *) typ;
+		size_t nfields = styp->nfields;
+		size_t offset;
+
+		if (i >= nfields) return 0;
+		/* styp is on stack top */
+		if (lua_getuservalue(L, -1) != LUA_TTABLE)
+			goto fail; /* object is corrupted */
+		if (lua_rawgeti(L, -1, i+1+nfields) != LUA_TNUMBER)
+			goto fail;
+		offset = lua_tonumber(L, -1);
+		var = (char *) var + offset;
+		/* the following code replaces struct type with field type */
+		/* stack is: ... styp, table, number| */
+		lua_rawgeti(L, -2, i+1);
+		typ = lua_touserdata(L, -1);
+		type = typ->type->type;
+		/* stack is: ... styp, table, number, typ| */
+		lua_copy(L, -1, -4);
+		lua_pop(L, 3);
+		/* stack is: ... typ| */
+	} else {
+		const char *tname;
+fail:
+		tname = type_names[type];
 		luaL_error(L, "attempt to index %s %s value",
 			(tname[0] == 'i' || tname[0] == 'u') ? "an" : "a",
-			tname);
+			tname); /* FIXME: does `uint' begin with a vowel? */
 	}
-	if (i >= typ->arraysize) {
-		luaL_error(L, "index out of range");
-	}
-	*type = typ->type->type;
-	return (char *) var + i * typ->type->size;
+	*ptype = type;
+	return var;
 }
 
 static
@@ -487,7 +544,16 @@ int c_index(lua_State *L)
 	int type;
 
 	addr = index2addr(L, &type);
-	cast_c_lua(L, addr, type);
+	if (!cast_c_lua(L, addr, type)) {
+		struct ctype *typ;
+		void *var;
+
+		lua_pop(L, 1); /* cast_c_lua pushes a nil on failure */
+		/* shallow copy */
+		typ = lua_touserdata(L, -1);
+		var = makecvar_(L, -1);
+		memcpy(var, addr, c_sizeof_(typ));
+	}
 	return 1;
 }
 
@@ -505,23 +571,15 @@ int c_newindex(lua_State *L)
 static
 int c_sizeof(lua_State *L)
 {
-	ffi_type *type;
-	size_t size, arraysize;
 	struct ctype *typ;
 
 	if (luaL_testudata(L, 1, "ffi_cvar")) {
 		typ = c_typeof_(L, 1, 1);
-		type = typ->type;
-		arraysize = typ->arraysize;
 	} else {
-		type = type_info(L, 1, &arraysize);
+		typ = luaL_checkudata(L, 1, "ffi_ctype");
 	}
 
-	size = type->size;
-	if (arraysize > 0)
-		size *= arraysize;
-
-	lua_pushinteger(L, size);
+	lua_pushinteger(L, c_sizeof_(typ));
 	return 1;
 }
 
@@ -552,10 +610,10 @@ int c_tostr(lua_State *L)
 			lua_pushfstring(L, "array of %s: %p",
 				type_names[type], var);
 		}
-	} else {
-		/* currently cast_c_lua never fails... */
-		cast_c_lua(L, var, type);
+	} else if (cast_c_lua(L, var, type)) {
 		lua_tostring(L, -1);
+	} else {
+		lua_pushfstring(L, "%s: %p", type_names[type], var);
 	}
 	return 1;
 }
@@ -596,6 +654,26 @@ int c_ptrderef(lua_State *L)
 	return cast_c_lua(L, ptr, type->type);
 }
 
+#if 0
+static
+int c_ptrfield(lua_State *L)
+{
+	struct ctype *typ;
+	char *ptr;
+	size_t i;
+
+	ptr = luaL_checkudata(L, 1, "ffi_cvar");
+	typ = c_typeof_(L, 1, 1);
+	luaL_argcheck(L, typ->type->type == FFI_TYPE_STRUCT, 1, "expect a struct");
+	i = luaL_checkinteger(L, 2);
+	if (i >= typ->fields[0])
+		return luaL_error(L, "field does not exist");
+	ptr += typ->fields[i+1];
+	lua_pushlightuserdata(L, ptr);
+	return 1;
+}
+#endif
+
 static
 int c_tonum(lua_State *L)
 {
@@ -624,7 +702,7 @@ struct ctype *makectype_(lua_State *L, ffi_type *type, size_t arraysize)
 
 	typ = lua_newuserdata(L, sizeof (struct ctype));
 	typ->type = type;
-	typ->arraysize = arraysize; /* we are defining basic types */
+	typ->arraysize = arraysize;
 	luaL_setmetatable(L, "ffi_ctype");
 	return typ;
 }
@@ -653,15 +731,65 @@ int makearraytype(lua_State *L)
 	return 1;
 }
 
-#if 0
-static
-int struct_t(lua_State *L)
-{
-	int table = 1;
+/* TODO: fix functions that breaks with structs */
 
-	luaL_checktype(L, table, LUA_TTABLE);
+static
+int makestructtype(lua_State *L)
+{
+	struct cstruct_ *typ;
+	int nfields;
+	int i;
+	ffi_abi ABI;
+	ffi_status status;
+	size_t *offsets;
+
+	luaL_checktype(L, 1, LUA_TTABLE);
+	nfields = (int) lua_rawlen(L, 1);
+
+	luaL_argcheck(L, nfields > 0, 1, "expect at least one field.");
+	typ = lua_newuserdata(L, sizeof (struct cstruct_) + sizeof (ffi_type *) * (nfields));
+	typ->ffi.size = typ->ffi.alignment = 0;
+	typ->ffi.type = FFI_TYPE_STRUCT;
+	typ->ffi.elements = typ->elements;
+
+	/* comp->elements to be fill in the follwing loop */
+	/* we arrange the table t (at position 1) like this:
+	 * i = 1..nfields: t[i] references to the type;
+	 * i = nfields+1..2*nfields: t[i] is the offset of the (i-nfields)-th field.
+	 */
+	for (i = 0; i < nfields; i++) {
+		lua_rawgeti(L, 1, i+1);
+		typ->elements[i] = type_info(L, -1, 0); /* array members not supported */
+		lua_pop(L, 1); /* typ */
+	}
+	typ->elements[nfields] = 0;
+	lua_pushvalue(L, 1);
+	lua_setuservalue(L, -2); /* typ.uservalue = (table) */
+
+	lua_getfield(L, 1, "ABI");
+	ABI = luaL_optinteger(L, -1, FFI_DEFAULT_ABI);
+	lua_pop(L, 1); /* ABI */
+
+	typ->ctype.type = &typ->ffi;
+	typ->ctype.arraysize = 0;
+	typ->nfields = nfields;
+
+	offsets = alloca(sizeof (size_t) * nfields);
+	/* XXX: current version of libffi doesn't have this function.
+	 * need GIT version 38a4d72c or newer. */
+	status = ffi_get_struct_offsets(ABI, &typ->ffi, offsets);
+	check_status(L, status);
+
+	/* store the offsets into the table */
+	for (i = 0; i < nfields; i++) {
+		lua_pushinteger(L, offsets[i]);
+		lua_rawseti(L, 1, i+1+nfields);
+	}
+
+	luaL_setmetatable(L, "ffi_ctype");
+
+	return 1;
 }
-#endif
 
 static
 void cl_proxy(ffi_cif *cif, void *ret, void *args[], void *ud)
@@ -758,8 +886,12 @@ luaL_Reg ffi_reg[] = {
 	{"cif", f_setproto},
 	{"array", makearraytype},
 	{"deref", c_ptrderef},
+#if 0
+	{"field", c_ptrfield},
+#endif
 	{"closure", makeclosure},
 	{"sizeof", c_sizeof},
+	{"struct", makestructtype},
 	{"tonumber", c_tonum},
 	{"openlib", 0}, /* placeholder */
 	{0, 0}

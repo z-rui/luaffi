@@ -130,10 +130,7 @@ int cast_lua_c(lua_State *L, int i, void *addr, int type)
 		void *var = luaL_checkudata(L, i, "ffi_cvar");
 		struct ctype *typ = c_typeof_(L, i, 1);
 		if (type == typ->type->type) {
-			size_t size = typ->type->size;
-			if (typ->arraysize > 0)
-				size *= typ->arraysize;
-			memcpy(addr, var, size);
+			memcpy(addr, var, c_sizeof_(typ));
 			rc = 1;
 		}
 	}
@@ -155,19 +152,25 @@ int cast_c_lua(lua_State *L, void *addr, int type)
 
 	switch (type) {
 		case FFI_TYPE_UINT8: i = *(uint8_t *) addr; goto cast_int;
-		case FFI_TYPE_UINT16: i = *(uint16_t *) addr; goto cast_int;
-		case FFI_TYPE_UINT32: i = *(uint32_t *) addr; goto cast_int;
-		case FFI_TYPE_UINT64: i = *(uint64_t *) addr; goto cast_int;
 		case FFI_TYPE_SINT8: i = *(int8_t *) addr; goto cast_int;
+		case FFI_TYPE_UINT16: i = *(uint16_t *) addr; goto cast_int;
 		case FFI_TYPE_SINT16: i = *(int16_t *) addr; goto cast_int;
+#if LUA_MAXINTEGER >= INT32_MAX
 		case FFI_TYPE_SINT32: i = *(int32_t *) addr; goto cast_int;
+		case FFI_TYPE_UINT32: i = *(uint32_t *) addr; goto cast_int;
+#endif
+#if LUA_MAXINTEGER >= INT64_MAX
 		case FFI_TYPE_SINT64: i = *(int64_t *) addr; goto cast_int;
+		case FFI_TYPE_UINT64: i = *(uint64_t *) addr; goto cast_int;
+#endif
 cast_int:
 			lua_pushinteger(L, i); break;
 
 		case FFI_TYPE_FLOAT: n = *(float *) addr; goto cast_num;
 		case FFI_TYPE_DOUBLE: n = *(double *) addr; goto cast_num;
+#if LUA_FLOAT_TYPE == LUA_FLOAT_LONGDOUBLE
 		case FFI_TYPE_LONGDOUBLE: n = *(long double *) addr; goto cast_num;
+#endif
 cast_num:
 			lua_pushnumber(L, n); break;
 
@@ -185,6 +188,7 @@ cast_num:
 			 * support STRUCT etc., it's probably
 			 * OK to call makecvar_ here */
 			lua_pushnil(L);
+			return 0;
 	}
 	return 1;
 }
