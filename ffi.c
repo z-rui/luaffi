@@ -90,6 +90,8 @@ struct cfunc {
 
 struct closure {
 	lua_State *L;
+	/* cl is allocated by libffi;
+	 * it requires a __gc method. */
 	ffi_closure *cl;
 	void *addr;
 	int ref; /* ref of lua closure */
@@ -297,6 +299,32 @@ void check_status(lua_State *L, int status)
 
 static struct cvar *makecvar_(lua_State *, int);
 
+static
+void cast_or_box_(lua_State *L, void *addr, int i, int type)
+{
+	if (!cast_c_lua(L, addr, type)) {
+		struct ctype *typ;
+		void *var;
+
+		lua_pop(L, 1); /* cast_c_lua pushes a nil on failure */
+		typ = luaL_checkudata(L, i, "ffi_ctype");
+		/* shallow copy */
+		lua_pushvalue(L, i);
+		var = makecvar_(L, -1);
+		memcpy(var, addr, c_sizeof_(typ));
+	}
+}
+
+void stackdump(lua_State *L)
+{
+	fflush(stdout);
+	{int i; for (i = 1; i<=lua_gettop(L);i++)
+		fprintf(stderr, "%s ", lua_typename(L, lua_type(L, i)));
+		fprintf(stderr, "\n");
+	}
+}
+
+static
 int f_call(lua_State *L)
 {
 	struct cfunc *func;
@@ -356,21 +384,18 @@ int f_call(lua_State *L)
 
 	if (rtype->type == FFI_TYPE_VOID) {
 		ffi_call(&cif->cif, FFI_FN(func->fn), 0, args);
-	} else if (rtype->size <= sizeof rvalue) {
+		return 1;
+	}
+	/* cif is on stack top */
+	if (lua_getuservalue(L, -1) == LUA_TTABLE) {
+		lua_rawgeti(L, -1, 1);
+		lua_replace(L, -2);
+	}
+	/* rtype (or nil) is on stack top */
+	if (rtype->size <= sizeof rvalue) {
 		ffi_call(&cif->cif, FFI_FN(func->fn), &rvalue, args);
-		if (!cast_c_lua(L, &rvalue, rtype->type)) {
-			lua_pop(L, 1); /* nil */
-			goto large_rvalue;
-		}
+		cast_or_box_(L, &rvalue, -1, rtype->type);
 	} else {
-large_rvalue:
-		/* cif is on stack top */
-		if (lua_getuservalue(L, -1) == LUA_TTABLE) {
-			lua_rawgeti(L, -1, 1);
-			lua_replace(L, -2);
-		}
-		luaL_checkudata(L, -1, "ffi_ctype");
-		/* rtype is on stack top */
 		void *var = makecvar_(L, -1);
 		ffi_call(&cif->cif, FFI_FN(func->fn), var, args);
 	}
@@ -547,15 +572,9 @@ int c_index(lua_State *L)
 	addr = index2addr(L, &type);
 	if (!addr) {
 		lua_pushnil(L);
-	} else if (!cast_c_lua(L, addr, type)) {
-		struct ctype *typ;
-		void *var;
-
-		lua_pop(L, 1); /* cast_c_lua pushes a nil on failure */
-		/* shallow copy */
-		typ = lua_touserdata(L, -1);
-		var = makecvar_(L, -1);
-		memcpy(var, addr, c_sizeof_(typ));
+	} else {
+		/* ctype is on stack top */
+		cast_or_box_(L, addr, -1, type);
 	}
 	return 1;
 }
@@ -614,7 +633,11 @@ int c_tostr(lua_State *L)
 				type_names[type], var);
 		}
 	} else if (cast_c_lua(L, var, type)) {
-		lua_tostring(L, -1);
+		/* cast_c_lua always pushes primitive values
+		 * (no __tostring); safe to call luaL_tolstring */
+		luaL_tolstring(L, -1, 0);
+	} else if (type == FFI_TYPE_POINTER) {
+		lua_pushfstring(L, "pointer: %p", *(void **) var);
 	} else {
 		lua_pushfstring(L, "%s: %p", type_names[type], var);
 	}
@@ -654,7 +677,8 @@ int c_ptrderef(lua_State *L)
 		memcpy(var, ptr, type->size * arraysize);
 		return 1;
 	}
-	return cast_c_lua(L, ptr, type->type);
+	cast_or_box_(L, ptr, 2, type->type);
+	return 1;
 }
 
 #if 0
@@ -687,11 +711,11 @@ int c_tonum(lua_State *L)
 	var = luaL_checkudata(L, 1, "ffi_cvar");
 	typ = c_typeof_(L, 1, 1);
 	type = typ->type->type;
-	if (TYPE_IS_INT(type) || TYPE_IS_FLOAT(type)) {
-		cast_c_lua(L, var, type); /* must success */
-	} else if (type == FFI_TYPE_POINTER) {
+	if (type == FFI_TYPE_POINTER) {
 		/* for wizards who treat pointers as integers. */
 		lua_pushinteger(L, (lua_Integer) var);
+	} else if (cast_c_lua(L, var, type)) {/* a Lua Number can hold its value */
+		/* Fine. */;
 	} else {
 		lua_pushnil(L);
 	}
@@ -803,12 +827,13 @@ void cl_proxy(ffi_cif *cif, void *ret, void *args[], void *ud)
 	unsigned i;
 	int rtype;
 
-	if (!lua_checkstack(L, nargs + 1))
-		luaL_error(L, "C stack overflow"); /* sorry... */
+	luaL_checkstack(L, nargs + 1, "C stack overflow");
 	lua_rawgeti(L, LUA_REGISTRYINDEX, cl->ref);
 	luaL_checktype(L, -1, LUA_TFUNCTION);
 	/* push arguments */
 	for (i = 0; i < nargs; i++) {
+		/* FIXME cannot pass structs.
+		 * should change this to cast_or_box */
 		cast_c_lua(L, args[i], cif->arg_types[i]->type);
 	}
 	lua_call(L, nargs, 1);
