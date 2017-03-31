@@ -54,27 +54,6 @@ struct cstruct_ {
 	ffi_type *elements[1]; /* 1 for the trailing NULL */
 };
 
-/* cif is stored as the uservalue of a function / closure
- * object.
- *
- * `cif' of a function may not be prepared when a function
- * is called; or it may be prepared for a different number
- * of arguments in the last call.  Thus `cif.nargs' cannot
- * be used to determine the number of parameters.  `nparams'
- * field in cfunc struct is provided for this purpose.
- *
- * `cif' of a closure is already prepared.  When a closure
- * is called, this struct does not change.
- *
- * The uservalue of a cif object is a Lua table referencing
- * types of return value and parameters.
- */
-struct cif {
-	ffi_cif cif;
-	ffi_type *types[1]; /* types[0] is rtype */
-	/* additional space types[1] etc are arg_types */
-};
-
 /* Note: supporting variadic function calls (by calling
  * ffi_prep_cif_var) turned out to be not very helpful;
  * this feature is removed for now.
@@ -83,9 +62,8 @@ struct cif {
  * to get the casting right. */
 struct cfunc {
 	lua_CFunction fn;
-	unsigned nparams;
-	int cache_valid;
 	/* we can borrow the abi field from cif. */
+	ffi_cif cif;
 };
 
 struct closure {
@@ -94,7 +72,9 @@ struct closure {
 	 * it requires a __gc method. */
 	ffi_closure *cl;
 	void *addr;
-	int ref; /* ref of lua closure */
+	int ref; /* ref of lua cif */
+	ffi_cif cif;
+	ffi_type *types[1];
 };
 
 /* loadlib, libname, funcname -> (func | true | nil err1 err2) */
@@ -140,17 +120,10 @@ static
 struct cfunc *makecfunc_(lua_State *L, lua_CFunction fn, ffi_abi ABI)
 {
 	struct cfunc *func;
-	struct cif *cif;
 
 	func = lua_newuserdata(L, sizeof (struct cfunc));
 	func->fn = fn;
-	func->nparams = 0;
-	func->cache_valid = 0;
-	/* make a default cif */
-	cif = lua_newuserdata(L, sizeof (struct cif));
-	cif->cif.abi = ABI;
-	cif->types[0] = &ffi_type_sint; /* default return int */
-	lua_setuservalue(L, -2); /* func.uservalue = cif */
+	func->cif.abi = ABI;
 	luaL_setmetatable(L, "ffi_cfunc");
 	
 	return func;
@@ -315,6 +288,7 @@ void cast_or_box_(lua_State *L, void *addr, int i, int type)
 	}
 }
 
+#if 0
 void stackdump(lua_State *L)
 {
 	fflush(stdout);
@@ -323,147 +297,129 @@ void stackdump(lua_State *L)
 		fprintf(stderr, "\n");
 	}
 }
+#endif
 
 static
 int f_call(lua_State *L)
 {
 	struct cfunc *func;
-	struct cif *cif;
 	void **args;
-	ffi_type *rtype;
-	ffi_type **atypes;
+	ffi_cif *cif;
+	ffi_type **types, **atypes, *rtype;
 	ffi_arg rvalue;
 	ffi_status status;
-	ffi_abi ABI;
 	unsigned int i;
 	unsigned nargs, nparams;
 
 	nargs = lua_gettop(L) - 1; /* exclude 'self' */
 	func = luaL_checkudata(L, 1, "ffi_cfunc");
-	lua_getuservalue(L, 1);
-	cif = lua_touserdata(L, -1);
-	ABI = cif->cif.abi;
-	nparams = func->nparams; /* don't use cif.nargs; it might have been modified by a previous call */
-	rtype = cif->types[0];
-	atypes = nparams ? &cif->types[1] : 0;
+	types = alloca(sizeof (ffi_type *) * (nargs+1));
+	if (lua_getuservalue(L, 1) == LUA_TTABLE) {
+		struct ctype *typ;
 
-	if (nargs < nparams) {
-		return luaL_error(L, "expect %d arguments, %d given",
-			nparams, nargs);
+		nparams = lua_rawlen(L, -1);
+		if (nargs < nparams) {
+			return luaL_error(L, "expect %d arguments, %d given",
+				nparams, nargs);
+		}
+		for (i = 0; i <= nparams; i++) {
+			lua_rawgeti(L, -1, i);
+			typ = lua_touserdata(L, -1);
+			types[i] = typ->type;
+			lua_pop(L, 1);
+		}
+	} else {
+		types[0] = &ffi_type_sint;
+		nparams = 0;
 	}
+	/* cif table (or nil) is left on stack top */
+	rtype = types[0];
+	atypes = types + 1;
 
 	if (nargs > nparams) {
-		/* must allocate temporary atypes[] */
-		atypes = alloca(sizeof (ffi_type *) * nargs);
-		memcpy(atypes, &cif->types[1], sizeof (ffi_type *) * nparams);
-		/* set default types for additional arguments */
 		populate_atypes(L, atypes, nparams, nargs);
 	}
 
-	if (nargs != nparams)
-		func->cache_valid = 0;
-
-	if (!func->cache_valid) {
-		status = ffi_prep_cif(&cif->cif, ABI, nargs, rtype, atypes);
-		check_status(L, status);
-		if (nargs == nparams)
-			func->cache_valid = 1; /* cache for non-variadic functions */
-	}
+	/* TODO: cache cif? */
+	cif = &func->cif;
+	status = ffi_prep_cif(cif, cif->abi, nargs, rtype, atypes);
+	check_status(L, status);
 
 	if (nargs > 0) {
 		args = alloca(sizeof (void *) * nargs);
 		for (i = 0; i < nargs; i++) {
-			ffi_type *ftype = atypes[i];
-
-			args[i] = alloca(sizeof (ftype->size));
-			cast_lua_c(L, i+2, args[i], ftype->type);
+			args[i] = alloca(atypes[i]->size);
+			cast_lua_c(L, i+2, args[i], atypes[i]->type);
 		}
 	} else {
 		args = 0;
 	}
 
 	if (rtype->type == FFI_TYPE_VOID) {
-		ffi_call(&cif->cif, FFI_FN(func->fn), 0, args);
+		ffi_call(cif, FFI_FN(func->fn), 0, args);
 		return 1;
 	}
-	/* cif is on stack top */
-	if (lua_getuservalue(L, -1) == LUA_TTABLE) {
-		lua_rawgeti(L, -1, 1);
-		lua_replace(L, -2);
-	}
-	/* rtype (or nil) is on stack top */
+	if (lua_type(L, -1) == LUA_TTABLE)
+		lua_rawgeti(L, -1, 0); /* rtype */
 	if (rtype->size <= sizeof rvalue) {
-		ffi_call(&cif->cif, FFI_FN(func->fn), &rvalue, args);
+		ffi_call(cif, FFI_FN(func->fn), &rvalue, args);
+		/* if cif is nil, then stack top is not
+		 * a valid ctype object, but rtype must
+		 * be int, so does not matter */
 		cast_or_box_(L, &rvalue, -1, rtype->type);
 	} else {
-		void *var = makecvar_(L, -1);
-		ffi_call(&cif->cif, FFI_FN(func->fn), var, args);
+		void *var;
+		var = makecvar_(L, -1);
+		ffi_call(cif, FFI_FN(func->fn), var, args);
 	}
 	return 1;
 }
 
-/* |func, rtype, [atype, ...] -> |func cif */
+/* rtype, [atype, ...]| -> cif */
+/* cif is a table where:-
+ * cif[0] references the rtype, nil means returning void;
+ * cif[i] references the i-th atype.
+ */
 static
-struct cif *make_cif_(lua_State *L, ffi_abi ABI)
+void make_cif_(lua_State *L, int nargs)
 {
-	struct cif *cif;
 	struct ctype *typ;
-	int nargs, i;
+	int i;
+	int r; /* the index of rtype */
 
-	nargs = lua_gettop(L) - 2;
-	if (lua_isnil(L, 2)) {
-		lua_pushlightuserdata(L, &voidtype);
-		lua_replace(L, 2);
-	} else {
-		type_info(L, 2, 0); /* ensure not an array */
-	}
-	cif = lua_newuserdata(L, sizeof (struct cif) + sizeof (ffi_type) * (nargs));
-
-	lua_pushvalue(L, 2);
-	typ = lua_touserdata(L, -1);
-	cif->cif.nargs = nargs;
-	cif->cif.abi = ABI;
-	cif->types[0] = typ->type;
-	/* stack: |func rtype [atype, ...] cif rtype */
-	if (nargs == 0) {
-		/* only reference the return type */
-		lua_setuservalue(L, -2); /* rtype popped */
-	} else {
-		/* must use a table to hold all types */
-		lua_createtable(L, nargs + 1, 0);
-		lua_insert(L, -2);
-		/* return type is on stack top */
-		lua_rawseti(L, -2, 1);
-		for (i = 0; i < nargs; i++) {
-			lua_pushvalue(L, i+3);
-			/* ensure not an array */
-			cif->types[i+1] = type_info(L, i+3, 0);
-			lua_rawseti(L, -2, i+2);
+	r = lua_gettop(L) - nargs;
+	assert(nargs >= 0 && r > 0);
+	lua_createtable(L, nargs, 2);
+	lua_insert(L, r); /* r is the index of the table now */
+	for (i = nargs; i > 0; i--) {
+		typ = luaL_checkudata(L, -1, "ffi_ctype");
+		if (typ->arraysize) {
+			luaL_error(L, "function cannot have an array parameter; use pointer instead");
 		}
-		/* reference the table */
-		lua_setuservalue(L, -2); /* table popped */
+		lua_rawseti(L, r, i); /* set i-th atype */
 	}
-	/* cif is on stack top */
-	lua_replace(L, 2);
-	lua_settop(L, 2);
-	return cif;
+	/* now i = 0 */
+	if (!lua_isnil(L, -1)) {
+		typ = luaL_checkudata(L, -1, "ffi_ctype");
+		if (typ->arraysize) {
+			luaL_error(L, "function cannot return an array");
+		}
+	} else {
+		lua_pop(L, 1);
+		lua_pushlightuserdata(L, &voidtype);
+	}
+	lua_rawseti(L, r, 0); /* set rtype */
 }
 
 static
 int f_setproto(lua_State *L)
 {
-	struct cfunc *func;
-	struct cif *cif;
-	ffi_abi ABI;
+	int nargs;
 
-	func = luaL_checkudata(L, 1, "ffi_cfunc");
-	lua_getuservalue(L, 1);
-	cif = lua_touserdata(L, -1);
-	ABI = cif->cif.abi;
-	lua_pop(L, 1); /* old cif */
-	cif = make_cif_(L, ABI);
+	luaL_checkudata(L, 1, "ffi_cfunc");
+	nargs = lua_gettop(L) - 2; /* minus the function itself and rtype */
+	make_cif_(L, nargs);
 	lua_setuservalue(L, 1); /* func.uservalue = new cif */
-	func->nparams = cif->cif.nargs;
 	return 1;
 }
 
@@ -824,17 +780,19 @@ void cl_proxy(ffi_cif *cif, void *ret, void *args[], void *ud)
 	struct closure *cl = (struct closure *) ud;
 	lua_State *L = cl->L;
 	unsigned nargs = cif->nargs;
-	unsigned i;
+	unsigned i, t; /* t: index of cif table */
 	int rtype;
 
-	luaL_checkstack(L, nargs + 1, "C stack overflow");
+	luaL_checkstack(L, nargs + 3, "C stack overflow");
 	lua_rawgeti(L, LUA_REGISTRYINDEX, cl->ref);
-	luaL_checktype(L, -1, LUA_TFUNCTION);
+	t = lua_absindex(L, -1);
+	lua_rawgeti(L, t, -1);
+	/*luaL_checktype(L, -1, LUA_TFUNCTION);*/
 	/* push arguments */
 	for (i = 0; i < nargs; i++) {
-		/* FIXME cannot pass structs.
-		 * should change this to cast_or_box */
-		cast_c_lua(L, args[i], cif->arg_types[i]->type);
+		lua_rawgeti(L, t, i+1);
+		cast_or_box_(L, args[i], -1, cif->arg_types[i]->type);
+		lua_replace(L, -2);
 	}
 	lua_call(L, nargs, 1);
 	rtype = cif->rtype->type;
@@ -874,35 +832,43 @@ static
 int makeclosure(lua_State *L)
 {
 	struct closure *cl;
-	struct cif *cif;
-	int nargs;
+	int nargs, i;
 	ffi_status status;
 
 	luaL_checktype(L, 1, LUA_TFUNCTION);
 	nargs = lua_gettop(L) - 2;
 
-	cl = lua_newuserdata(L, sizeof (struct closure));
+	make_cif_(L, nargs);
+	/* rtype and atypes are popped from the stack;
+	 * only the function is left */
+	lua_insert(L, 1);
+	lua_rawseti(L, 1, -1); /* cif[-1] = the Lua function */
+
+	cl = lua_newuserdata(L, sizeof (struct closure) + sizeof (ffi_type *) * (nargs + 1));
 	cl->L = L;
 	cl->cl = 0;
 	cl->addr = 0;
 	cl->ref = LUA_NOREF;
 	luaL_setmetatable(L, "ffi_closure");
+	for (i = 0; i <= nargs; i++) {
+		struct ctype *typ;
 
-	lua_pushvalue(L, 1); /* the Lua function */
-	cl->ref = luaL_ref(L, LUA_REGISTRYINDEX);
-	lua_replace(L, 1);
+		lua_rawgeti(L, 1, i);
+		typ = lua_touserdata(L, -1);
+		cl->types[i] = typ->type;
+		lua_pop(L, 1);
+	}
+	lua_insert(L, 1);
+	cl->ref = luaL_ref(L, LUA_REGISTRYINDEX); /* cl->ref => cif table */
 
-	cif = make_cif_(L, FFI_DEFAULT_ABI);
-	lua_setuservalue(L, 1); /* closure.uservalue = cif */
-
-	status = ffi_prep_cif(&cif->cif, FFI_DEFAULT_ABI, nargs, cif->types[0], &cif->types[1]);
+	status = ffi_prep_cif(&cl->cif, FFI_DEFAULT_ABI, nargs, cl->types[0], &cl->types[1]);
 	check_status(L, status);
 
 	cl->cl = ffi_closure_alloc(sizeof (ffi_closure), &cl->addr);
 	if (!cl->cl)
 		return luaL_error(L, "allocating closure failed");
 
-	status = ffi_prep_closure_loc(cl->cl, &cif->cif, cl_proxy, cl, cl->addr);
+	status = ffi_prep_closure_loc(cl->cl, &cl->cif, cl_proxy, cl, cl->addr);
 	check_status(L, status);
 
 	return 1;
