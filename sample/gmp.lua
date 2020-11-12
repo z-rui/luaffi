@@ -12,7 +12,7 @@ __gmpz_clears = cif { ffi.pointer, }
 __gmpz_init_set_si = cif { ffi.pointer, ffi.slong }
 __gmpz_add = cif { ffi.pointer, ffi.pointer, ffi.pointer }
 __gmp_printf = cif { ret = ffi.sint, ffi.pointer, }
-_ENV = loadlib('libgmp.so.10', _ENV)
+_ENV = loadlib('libgmp.so', _ENV)
 
 local x, y = ffi.alloc(mpz), ffi.alloc(mpz)
 __gmpz_init_set_si(x, 0)

@@ -6,7 +6,7 @@ local libc, div_t do
     sint, "quot",
     sint, "rem",
   }
-  libc = loadlib('libc.so.6', {
+  libc = loadlib('libc.so', {
     printf = cif {ret = sint; pointer},
     div = cif {ret = div_t; sint, sint},
     memcpy = cif {ret = pointer; pointer, pointer, size_t},

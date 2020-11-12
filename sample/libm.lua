@@ -16,7 +16,7 @@ do
   libm.cimag = cif
 end
 
-libm = ffi.loadlib('libm.so.6', libm)
+libm = ffi.loadlib('libm.so', libm)
 
 for k, v in pairs(libm) do
   print(k, v)
