@@ -22,8 +22,7 @@ function game:make_food()
   self.food_pos = pos
 end
 
-function game:add_body(x, y)
-  local pos = y * self.width + x
+function game:add_body(pos)
   local body = self.body
 
   body.head = body.head % (self.width * self.height) + 1
@@ -35,7 +34,6 @@ end
 function game:remove_tail()
   local body = self.body
   local pos = body[body.tail]
-  local x, y = pos % self.width, pos // self.width
 
   body.tail = body.tail % (self.width * self.height) + 1
   self.state[pos] = nil
@@ -45,30 +43,27 @@ end
 function game:next()
   local body = self.body
   local pos = body[body.head]
-  local x, y = pos % self.width, pos // self.width
+  local width, height = self.width, self.height
+  local x, y = pos % width, pos // width
   local next_x, next_y = x + self.dx, y + self.dy
-  local next_pos = next_y * self.width + next_x
-  if next_x < 0 or next_x >= self.width or
-     next_y < 0 or next_y >= self.height then
-     print('hit border', next_x, next_y)
-     self.stopped = 1
+  local next_pos = next_y * width + next_x
+  local state = self.state[next_pos]
+  if next_x < 0 or next_x >= width or
+     next_y < 0 or next_y >= height or
+     state == 'BODY' then
+     self.stopped = true
      return
   end
-  if self.state[next_pos] == 'BODY' then
-    print('hit body', next_x, next_y)
-    self.stopped = 1
-    return
-  end
-  local state = self.state[next_pos]
-  self:add_body(next_x, next_y)
-  if state == 'FOOD' then
-    self:make_food()
-  else
+  if state ~= 'FOOD' then
     self:remove_tail()
   end
-  if self.size == self.width * self.height then
-    print('filled entire space')
-    self.stopped = 1
+  self:add_body(next_pos)
+  if self.size == width * height then
+    self.stopped = true
+    return
+  end
+  if state == 'FOOD' then
+    self:make_food()
   end
 end
 
@@ -104,31 +99,17 @@ local window = SDL_CreateWindow(
   SDL_WINDOW_OPENGL|SDL_WINDOW_FULLSCREEN_DESKTOP)
 
 local renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED)
-local kScale = 100
+SDL_RenderSetLogicalSize(renderer, game.width * 100, game.height * 100)
 
-local drawrect do
+local function drawline(x1, y1, x2, y2)
+  if x1 > x2 then x1, x2 = x2, x1 end
+  if y1 > y2 then y1, y2 = y2, y1 end
   local rect = ffi.alloc(SDL_Rect)
-  rect.w = kScale
-  rect.h = kScale
-  function drawrect(x, y, r, g, b)
-    rect.x = x * kScale
-    rect.y = y * kScale
-    SDL_SetRenderDrawColor(renderer, r, g, b, 255)
-    SDL_RenderFillRect(renderer, rect)
-  end
-end
-
-local drawline do
-  local rect = ffi.alloc(SDL_Rect)
-  function drawline(x1, y1, x2, y2)
-    if x1 > x2 then x1, x2 = x2, x1 end
-    if y1 > y2 then y1, y2 = y2, y1 end
-    rect.x = (x1 + 0.1) * kScale
-    rect.y = (y1 + 0.1) * kScale
-    rect.w = (x2 - x1 + 0.8) * kScale
-    rect.h = (y2 - y1 + 0.8) * kScale
-    SDL_RenderFillRect(renderer, rect)
-  end
+  rect.x = x1 * 100 + 10
+  rect.y = y1 * 100 + 10
+  rect.w = (x2 - x1) * 100 + 80
+  rect.h = (y2 - y1) * 100 + 80
+  SDL_RenderFillRect(renderer, rect)
 end
 
 local function redraw(game)
@@ -156,22 +137,17 @@ local function redraw(game)
 end
 
 -- init state
-SDL_RenderSetLogicalSize(renderer, game.width * kScale, game.height * kScale)
 game:add_body(0, 0)
 game:add_body(1, 0)
 game:add_body(2, 0)
 game:make_food()
 
-local window_event_handler = {
-  [SDL_WINDOWEVENT_EXPOSED] = function(event)
-    redraw(game)
-  end
-}
 local event_handler = {
   [SDL_WINDOWEVENT] = function(event)
     local eventid = ffi.deref(event, ffi.field(SDL_WindowEvent, "event"))
-    local handler = window_event_handler[eventid]
-    if handler then return handler(event) end
+    if eventid == SDL_WINDOWEVENT_EXPOSED then
+      redraw(game)
+    end
   end,
   [SDL_KEYDOWN] = function(event)
     local scancode = ffi.deref(event, ffi.field(SDL_KeyboardEvent, "keysym", "scancode"))
@@ -192,6 +168,7 @@ local event_handler = {
 }
 
 local ok, err = pcall(function()
+  -- main loop
   local event = ffi.alloc(ffi.char, 56)  -- sizeof (SDL_Event) == 56
   while true do
     local status = SDL_WaitEventTimeout(event, 500)
