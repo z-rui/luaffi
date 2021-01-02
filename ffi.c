@@ -9,6 +9,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+#include <malloc.h>
+#define alloca _alloca
+#endif
+
 #define INT_TYPE_LIST_(macro) \
 	macro(FFI_TYPE_UINT8, uint8_t, uint8) \
 	macro(FFI_TYPE_UINT16, uint16_t, uint16) \
@@ -605,7 +610,7 @@ int cast2ptr(lua_State *L, int idx, void **ptr)
 		switch (type->size) { FLOAT_TYPE_LIST_(COMPLEX_CASE) } \
 	}
 #else
-# define COMPLEX_CASES
+# define COMPLEX_CASES }
 #endif
 
 #define CAST_TMPL(NAME, TYPE) \
