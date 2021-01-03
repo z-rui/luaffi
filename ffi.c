@@ -609,7 +609,7 @@ int cast2ptr(lua_State *L, int idx, void **ptr)
 	case FFI_TYPE_COMPLEX: \
 		switch (type->size) { FLOAT_TYPE_LIST_(COMPLEX_CASE) }
 #else
-# define COMPLEX_CASES }
+# define COMPLEX_CASES
 #endif
 
 #define CAST_TMPL(NAME, TYPE) \
