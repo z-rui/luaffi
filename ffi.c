@@ -602,8 +602,7 @@ int cast2ptr(lua_State *L, int idx, void **ptr)
 #ifdef FFI_TARGET_HAS_COMPLEX_TYPE
 # define COMPLEX_CASES \
 	case FFI_TYPE_COMPLEX: \
-		switch (type->size) { FLOAT_TYPE_LIST_(COMPLEX_CASE) } \
-	}
+		switch (type->size) { FLOAT_TYPE_LIST_(COMPLEX_CASE) }
 #else
 # define COMPLEX_CASES
 #endif
@@ -615,6 +614,7 @@ static int NAME(TYPE n, void *addr, ffi_type *type) \
 		INT_TYPE_LIST_(CAST_CASE) \
 		FLOAT_TYPE_LIST_(CAST_CASE) \
 		COMPLEX_CASES \
+	} \
 	return 0; \
 }
 
